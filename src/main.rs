@@ -209,14 +209,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Error: hy1 address checksum mismatch");
             std::process::exit(1);
         }
-        // Extract spend public key (bytes 33..65) for mining payout
-        payload[33..65].to_vec()
+        // Return view_public (32) + spend_public (32) = 64 bytes
+        payload[1..65].to_vec()
     } else {
         hex::decode(&cli.wallet_address)
             .expect("--wallet_address must be a hy1... address or 64 hex chars")
     };
-    if wallet_pubkey.len() != 32 {
-        eprintln!("Error: wallet address must decode to exactly 32 bytes");
+    if wallet_pubkey.len() != 32 && wallet_pubkey.len() != 64 {
+        eprintln!("Error: wallet address must decode to 32 or 64 bytes");
         std::process::exit(1);
     }
     info!("Payout wallet: {}", hex::encode(&wallet_pubkey));
