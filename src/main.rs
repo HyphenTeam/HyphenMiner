@@ -11,7 +11,7 @@ use prost::Message;
 use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
-use pow::{difficulty_to_target, evaluate_pow, EpochArena};
+use pow::{difficulty_to_target, evaluate_pow, evaluate_pow_with_epoch, EpochArena, EpochKernelParams};
 use primitives::{BlockHeader, ChainConfig, Hash256, SecretKey};
 use protocol::*;
 
@@ -84,6 +84,8 @@ struct MinerState {
     blocks_found: AtomicU64,
     running: AtomicBool,
     shared_arena: RwLock<Option<(Hash256, Arc<EpochArena>)>>,
+    /// Incremented on each new connection so stale mining threads exit.
+    connection_generation: AtomicU64,
 }
 
 impl MinerState {
@@ -100,6 +102,7 @@ impl MinerState {
             blocks_found: AtomicU64::new(0),
             running: AtomicBool::new(true),
             shared_arena: RwLock::new(None),
+            connection_generation: AtomicU64::new(0),
         }
     }
 
@@ -221,10 +224,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("Payout wallet: {}", hex::encode(&wallet_pubkey));
 
+    let mut backoff_secs = 5u64;
     loop {
         if !state.running.load(Ordering::Relaxed) {
             break;
         }
+
+        let conn_start = std::time::Instant::now();
 
         match connect_and_mine(
             &cli.pool,
@@ -241,8 +247,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(()) => break,
             Err(e) => {
                 error!("Connection lost: {e}");
-                info!("Reconnecting in 5 seconds...");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                // Reset backoff if we were connected for a while
+                if conn_start.elapsed().as_secs() > 60 {
+                    backoff_secs = 5;
+                }
+                info!("Reconnecting in {backoff_secs} seconds...");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(120);
             }
         }
     }
@@ -261,7 +272,28 @@ async fn connect_and_mine(
     cli_batch_size: u64,
     wallet_pubkey: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Bump connection generation so stale mining threads from a previous
+    // connection will see the change and exit.
+    state.connection_generation.fetch_add(1, Ordering::Release);
+    *state.current_job.write() = None;
+    state.job_generation.fetch_add(1, Ordering::Release);
+
     let mut stream = TcpStream::connect(pool_addr).await?;
+
+    // Enable TCP keepalive to detect dead connections through NAT/firewalls.
+    {
+        let std_sock = stream.into_std()?;
+        let sock = socket2::Socket::from(std_sock);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(30))
+            .with_interval(std::time::Duration::from_secs(10));
+        sock.set_tcp_keepalive(&keepalive)?;
+        sock.set_nodelay(true)?;
+        let std_sock: std::net::TcpStream = sock.into();
+        std_sock.set_nonblocking(true)?;
+        stream = TcpStream::from_std(std_sock)?;
+    }
+
     info!("Connected to pool at {pool_addr}");
 
     let estimated_hashrate = state
@@ -308,12 +340,14 @@ async fn connect_and_mine(
 
     let pool_pubkey = ack_env.sender_pubkey.clone();
 
+    let conn_gen = state.connection_generation.load(Ordering::Acquire);
+
     let cfg_clone = cfg.clone();
     let state_clone = Arc::clone(state);
-    let submit_tx = start_mining_threads(threads, cfg_clone.clone(), state_clone, cli_batch_size);
+    let submit_tx = start_mining_threads(threads, cfg_clone.clone(), state_clone, cli_batch_size, conn_gen);
 
     let hashrate_state = Arc::clone(state);
-    let _hashrate_handle = tokio::spawn(async move {
+    let hashrate_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         let mut last_hashes: u64 = 0;
         loop {
@@ -342,7 +376,7 @@ async fn connect_and_mine(
 
     let writer = Arc::clone(&write_half);
     let ka_sk = keepalive_sk.clone();
-    let _keepalive_handle = tokio::spawn(async move {
+    let keepalive_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
@@ -363,7 +397,7 @@ async fn connect_and_mine(
     let report_sk = sk.clone();
     let report_state = Arc::clone(state);
     let start_time = std::time::Instant::now();
-    let _hashrate_report_handle = tokio::spawn(async move {
+    let hashrate_report_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         let mut last_hashes: u64 = 0;
         loop {
@@ -395,10 +429,15 @@ async fn connect_and_mine(
 
     let mut share_rx = submit_tx;
 
+    let loop_result: Result<(), Box<dyn std::error::Error>> = async {
+    let read_timeout = std::time::Duration::from_secs(90);
     loop {
         tokio::select! {
-            result = read_envelope_from(&read_half) => {
-                let env = result?;
+            result = tokio::time::timeout(read_timeout, read_envelope_from(&read_half)) => {
+                let env = match result {
+                    Ok(r) => r?,
+                    Err(_) => return Err("pool read timeout (90s with no data)".into()),
+                };
                 if !pool_pubkey.is_empty() {
                     env.verify()?;
                 }
@@ -479,6 +518,14 @@ async fn connect_and_mine(
             }
         }
     }
+    }.await;
+
+    // Abort background tasks so they don't leak on reconnect
+    hashrate_handle.abort();
+    keepalive_handle.abort();
+    hashrate_report_handle.abort();
+
+    loop_result
 }
 
 async fn read_envelope_from(
@@ -557,6 +604,7 @@ fn start_mining_threads(
     cfg: ChainConfig,
     state: Arc<MinerState>,
     batch_size: u64,
+    conn_gen: u64,
 ) -> tokio::sync::mpsc::UnboundedReceiver<ShareResult> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -566,7 +614,7 @@ fn start_mining_threads(
         let tx = tx.clone();
 
         std::thread::spawn(move || {
-            mining_thread(thread_id, threads, cfg, state, tx, batch_size);
+            mining_thread(thread_id, threads, cfg, state, tx, batch_size, conn_gen);
         });
     }
 
@@ -580,6 +628,7 @@ fn mining_thread(
     state: Arc<MinerState>,
     tx: tokio::sync::mpsc::UnboundedSender<ShareResult>,
     batch_size: u64,
+    conn_gen: u64,
 ) {
     info!("Mining thread {thread_id}/{thread_count} started (batch_size={batch_size})");
 
@@ -588,6 +637,10 @@ fn mining_thread(
 
     loop {
         if !state.running.load(Ordering::Relaxed) {
+            break;
+        }
+        // Exit if the connection has been replaced by a new one
+        if state.connection_generation.load(Ordering::Acquire) != conn_gen {
             break;
         }
 
@@ -609,6 +662,9 @@ fn mining_thread(
         let share_diff = state.current_share_difficulty.load(Ordering::Acquire);
         let share_target = difficulty_to_target(share_diff);
 
+        // Pre-compute epoch kernel params once per job (same epoch → same params)
+        let epoch = EpochKernelParams::derive(arena.params.epoch_seed.as_bytes());
+
         let base_nonce: u64 =
             rand::random::<u64>() / thread_count as u64 * thread_count as u64 + thread_id as u64;
 
@@ -629,7 +685,7 @@ fn mining_thread(
             let nonce = base_nonce.wrapping_add(i * thread_count as u64);
             candidate.nonce = nonce;
 
-            let hash = evaluate_pow(&candidate, &arena, &cfg);
+            let hash = evaluate_pow_with_epoch(&candidate, &arena, &cfg, &epoch);
             state.total_hashes.fetch_add(1, Ordering::Relaxed);
 
             if hash_below_target(&hash, &share_target) {
