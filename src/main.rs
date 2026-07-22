@@ -2,6 +2,7 @@ mod pow;
 mod primitives;
 mod protocol;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -11,8 +12,10 @@ use prost::Message;
 use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
-use pow::{difficulty_to_target, evaluate_pow, evaluate_pow_with_epoch, EpochArena, EpochKernelParams};
-use primitives::{BlockHeader, ChainConfig, Hash256, SecretKey};
+use pow::{difficulty_to_target, evaluate_pow_with_epoch, EpochArena, EpochKernelParams};
+use primitives::{
+    BlockAuthorization, BlockHeader, ChainConfig, Hash256, SecretKey, FROZEN_BLOCK_VERSION,
+};
 use protocol::*;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -33,7 +36,7 @@ struct Cli {
     #[arg(long, default_value = "0")]
     threads: usize,
 
-    #[arg(long, default_value = "testnet")]
+    #[arg(long, value_parser = ["mainnet", "testnet", "devnet"], default_value = "devnet")]
     network: String,
 
     #[arg(long, default_value = "")]
@@ -50,6 +53,11 @@ struct Cli {
     /// If not specified, the miner's signing key is used as the payout key.
     #[arg(long, default_value = "")]
     wallet_address: String,
+
+    /// Explicitly permits a shared pool to direct coinbase to its advertised
+    /// settlement wallet. The exact reward keys remain miner-authorized.
+    #[arg(long, default_value_t = false)]
+    allow_shared_reward_recipient: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -70,6 +78,8 @@ struct MiningJob {
     epoch_seed: Hash256,
     arena_size: usize,
     page_size: usize,
+    reward_view_public: [u8; 32],
+    reward_spend_public: [u8; 32],
 }
 
 struct MinerState {
@@ -86,6 +96,9 @@ struct MinerState {
     shared_arena: RwLock<Option<(Hash256, Arc<EpochArena>)>>,
     /// Incremented on each new connection so stale mining threads exit.
     connection_generation: AtomicU64,
+    receipt_sequence: AtomicU64,
+    receipt_head: RwLock<[u8; 32]>,
+    pending_submission_hashes: RwLock<VecDeque<[u8; 32]>>,
 }
 
 impl MinerState {
@@ -103,6 +116,9 @@ impl MinerState {
             running: AtomicBool::new(true),
             shared_arena: RwLock::new(None),
             connection_generation: AtomicU64::new(0),
+            receipt_sequence: AtomicU64::new(0),
+            receipt_head: RwLock::new([0u8; 32]),
+            pending_submission_hashes: RwLock::new(VecDeque::new()),
         }
     }
 
@@ -159,8 +175,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = match cli.network.as_str() {
         "mainnet" => ChainConfig::mainnet(),
-        _ => ChainConfig::testnet(),
+        "testnet" => ChainConfig::testnet(),
+        "devnet" => ChainConfig::devnet(),
+        _ => unreachable!("clap validates network"),
     };
+
+    if cli.network == "mainnet" && cli.key_file.is_empty() {
+        return Err(
+            "mainnet mining requires --key-file; ephemeral miner identities are unsafe".into(),
+        );
+    }
+    if cli.batch_size == 0 {
+        return Err("--batch-size must be greater than zero".into());
+    }
 
     let threads = if cli.threads == 0 {
         std::thread::available_parallelism()
@@ -191,9 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(MinerState::new());
 
-    let wallet_pubkey = if cli.wallet_address.is_empty() {
-        sk.public_key().as_bytes().to_vec()
-    } else if cli.wallet_address.starts_with("hy1") {
+    let wallet_pubkey = if cli.wallet_address.starts_with("hy1") {
         let encoded = &cli.wallet_address[3..];
         let payload = bs58::decode(encoded)
             .into_vec()
@@ -206,6 +231,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(1);
         }
+        let expected_version = if cfg.network_magic == [0x48, 0x59, 0x50, 0x4e] {
+            0x01
+        } else {
+            0x02
+        };
+        if payload[0] != expected_version {
+            eprintln!("Error: wallet address belongs to a different Hyphen network");
+            std::process::exit(1);
+        }
         let checksum = &payload[65..69];
         let hash = blake3::hash(&payload[..65]);
         if checksum != &hash.as_bytes()[..4] {
@@ -215,12 +249,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Return view_public (32) + spend_public (32) = 64 bytes
         payload[1..65].to_vec()
     } else {
-        hex::decode(&cli.wallet_address)
-            .expect("--wallet_address must be a hy1... address or 64 hex chars")
+        return Err("pool protocol v3 requires --wallet-address with a hy1... address".into());
     };
-    if wallet_pubkey.len() != 32 && wallet_pubkey.len() != 64 {
-        eprintln!("Error: wallet address must decode to 32 or 64 bytes");
-        std::process::exit(1);
+    if wallet_pubkey.len() != 64 {
+        return Err("wallet address must decode to 64 view/spend public-key bytes".into());
     }
     info!("Payout wallet: {}", hex::encode(&wallet_pubkey));
 
@@ -241,6 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &state,
             cli.batch_size,
             &wallet_pubkey,
+            cli.allow_shared_reward_recipient,
         )
         .await
         {
@@ -271,6 +304,7 @@ async fn connect_and_mine(
     state: &Arc<MinerState>,
     cli_batch_size: u64,
     wallet_pubkey: &[u8],
+    allow_shared_reward_recipient: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Bump connection generation so stale mining threads from a previous
     // connection will see the change and exit.
@@ -307,6 +341,10 @@ async fn connect_and_mine(
         payout_pubkey: wallet_pubkey.to_vec(),
         estimated_hashrate,
         thread_count: threads as u32,
+        network_magic: cfg.network_magic.to_vec(),
+        protocol_version: POOL_PROTOCOL_VERSION,
+        consensus_params_hash: cfg.consensus_params_hash().to_vec(),
+        genesis_hash: cfg.genesis_hash().to_vec(),
     };
     let env = PoolEnvelope::sign(MSG_LOGIN, login.encode_to_vec(), sk);
     PoolCodec::write_envelope(&mut stream, &env).await?;
@@ -321,6 +359,23 @@ async fn connect_and_mine(
     let ack = LoginAck::decode(&ack_env.payload[..])?;
     if !ack.accepted {
         return Err(format!("login rejected: {}", ack.error).into());
+    }
+    if ack.protocol_version != POOL_PROTOCOL_VERSION
+        || ack.network_magic.as_slice() != cfg.network_magic
+        || ack.network_name != cfg.network_name
+        || ack.consensus_params_hash.as_slice() != cfg.consensus_params_hash()
+        || ack.genesis_hash.as_slice() != cfg.genesis_hash()
+    {
+        return Err(format!(
+            "pool network mismatch: expected {} ({}) v{}, got {} ({}) v{}",
+            cfg.network_name,
+            hex::encode(cfg.network_magic),
+            POOL_PROTOCOL_VERSION,
+            ack.network_name,
+            hex::encode(&ack.network_magic),
+            ack.protocol_version,
+        )
+        .into());
     }
 
     info!(
@@ -338,13 +393,27 @@ async fn connect_and_mine(
         .store(ack.share_difficulty, Ordering::Release);
     state.difficulty_generation.fetch_add(1, Ordering::AcqRel);
 
-    let pool_pubkey = ack_env.sender_pubkey.clone();
+    let pool_pubkey: [u8; 32] = ack_env
+        .sender_pubkey
+        .as_slice()
+        .try_into()
+        .map_err(|_| "pool public key must be exactly 32 bytes")?;
+    state.receipt_sequence.store(0, Ordering::Release);
+    *state.receipt_head.write() = [0u8; 32];
+    state.pending_submission_hashes.write().clear();
 
     let conn_gen = state.connection_generation.load(Ordering::Acquire);
 
     let cfg_clone = cfg.clone();
     let state_clone = Arc::clone(state);
-    let submit_tx = start_mining_threads(threads, cfg_clone.clone(), state_clone, cli_batch_size, conn_gen);
+    let submit_tx = start_mining_threads(
+        threads,
+        cfg_clone.clone(),
+        state_clone,
+        cli_batch_size,
+        conn_gen,
+        sk.clone(),
+    );
 
     let hashrate_state = Arc::clone(state);
     let hashrate_handle = tokio::spawn(async move {
@@ -430,95 +499,123 @@ async fn connect_and_mine(
     let mut share_rx = submit_tx;
 
     let loop_result: Result<(), Box<dyn std::error::Error>> = async {
-    let read_timeout = std::time::Duration::from_secs(90);
-    loop {
-        tokio::select! {
-            result = tokio::time::timeout(read_timeout, read_envelope_from(&read_half)) => {
-                let env = match result {
-                    Ok(r) => r?,
-                    Err(_) => return Err("pool read timeout (90s with no data)".into()),
-                };
-                if !pool_pubkey.is_empty() {
-                    env.verify()?;
-                }
-
-                match env.msg_type {
-                    MSG_JOB => {
-                        let template = JobTemplate::decode(&env.payload[..])?;
-                        handle_new_job(&template, cfg, state)?;
-                    }
-                    MSG_SUBMIT_RESULT => {
-                        let result = SubmitResult::decode(&env.payload[..])?;
-                        if result.accepted {
-                            state.shares_accepted.fetch_add(1, Ordering::Relaxed);
-                            if result.block_found {
-                                state.blocks_found.fetch_add(1, Ordering::Relaxed);
-                                info!(
-                                    "BLOCK FOUND! hash={}",
-                                    hex::encode(&result.block_hash)
-                                );
-                            }
-                        } else {
-                            state.shares_rejected.fetch_add(1, Ordering::Relaxed);
-                            warn!("Share rejected: {}", result.error);
-                        }
-                    }
-                    MSG_BLOCK_FOUND => {
-                        let notify = BlockFoundNotify::decode(&env.payload[..])?;
-                        info!(
-                            "Block found at height {} by {}",
-                            notify.height,
-                            hex::encode(&notify.finder_pubkey)
-                        );
-                    }
-                    MSG_SET_DIFFICULTY => {
-                        let set_diff = SetDifficulty::decode(&env.payload[..])?;
-                        info!(
-                            "VarDiff: pool adjusted share difficulty to {}",
-                            set_diff.share_difficulty
-                        );
-                        state.current_share_difficulty.store(
-                            set_diff.share_difficulty,
-                            Ordering::Release,
-                        );
-                        state.difficulty_generation.fetch_add(1, Ordering::AcqRel);
-                    }
-                    MSG_CHAIN_STATE => {
-                        let chain_info = ChainStateInfo::decode(&env.payload[..])?;
-                        info!(
-                            "Chain state update: height={}, block_diff={}, tip={}",
-                            chain_info.height,
-                            chain_info.difficulty,
-                            hex::encode(&chain_info.tip_hash),
-                        );
-                    }
-                    _ => {}
-                }
-            }
-
-            share = share_rx.recv() => {
-                if let Some((nonce, extra_nonce, pow_hash, job_id)) = share {
-                    let submission = ShareSubmission {
-                        job_id: job_id.to_vec(),
-                        nonce,
-                        extra_nonce: extra_nonce.to_vec(),
-                        pow_hash: pow_hash.as_bytes().to_vec(),
+        let read_timeout = std::time::Duration::from_secs(90);
+        loop {
+            tokio::select! {
+                result = tokio::time::timeout(read_timeout, read_envelope_from(&read_half)) => {
+                    let env = match result {
+                        Ok(r) => r?,
+                        Err(_) => return Err("pool read timeout (90s with no data)".into()),
                     };
-                    let env = PoolEnvelope::sign(
-                        MSG_SUBMIT,
-                        submission.encode_to_vec(),
-                        sk,
-                    );
-                    let data = env.encode_to_vec();
-                    let mut w = write_half.lock().await;
-                    use tokio::io::AsyncWriteExt;
-                    w.write_u32(data.len() as u32).await?;
-                    w.write_all(&data).await?;
+                    env.verify()?;
+
+                    match env.msg_type {
+                        MSG_JOB => {
+                            let template = JobTemplate::decode(&env.payload[..])?;
+                            handle_new_job(
+                                &template,
+                                cfg,
+                                state,
+                                *sk.public_key().as_bytes(),
+                                wallet_pubkey,
+                                allow_shared_reward_recipient,
+                            )?;
+                        }
+                        MSG_SUBMIT_RESULT => {
+                            let result = SubmitResult::decode(&env.payload[..])?;
+                            let submission_hash = state
+                                .pending_submission_hashes
+                                .write()
+                                .pop_front()
+                                .ok_or("pool returned a share result with no pending submission")?;
+                            if result.accepted {
+                                verify_share_receipt(
+                                    &env,
+                                    state,
+                                    &pool_pubkey,
+                                    sk.public_key().as_bytes(),
+                                    &submission_hash,
+                                )?;
+                                state.shares_accepted.fetch_add(1, Ordering::Relaxed);
+                                if result.block_found {
+                                    state.blocks_found.fetch_add(1, Ordering::Relaxed);
+                                    info!(
+                                        "BLOCK FOUND! hash={}",
+                                        hex::encode(&result.block_hash)
+                                    );
+                                }
+                            } else {
+                                state.shares_rejected.fetch_add(1, Ordering::Relaxed);
+                                warn!("Share rejected: {}", result.error);
+                            }
+                        }
+                        MSG_BLOCK_FOUND => {
+                            let notify = BlockFoundNotify::decode(&env.payload[..])?;
+                            info!(
+                                "Block found at height {} by {}",
+                                notify.height,
+                                hex::encode(&notify.finder_pubkey)
+                            );
+                        }
+                        MSG_SET_DIFFICULTY => {
+                            let set_diff = SetDifficulty::decode(&env.payload[..])?;
+                            info!(
+                                "VarDiff: pool adjusted share difficulty to {}",
+                                set_diff.share_difficulty
+                            );
+                            state.current_share_difficulty.store(
+                                set_diff.share_difficulty,
+                                Ordering::Release,
+                            );
+                            state.difficulty_generation.fetch_add(1, Ordering::AcqRel);
+                        }
+                        MSG_CHAIN_STATE => {
+                            let chain_info = ChainStateInfo::decode(&env.payload[..])?;
+                            info!(
+                                "Chain state update: height={}, block_diff={}, tip={}",
+                                chain_info.height,
+                                chain_info.difficulty,
+                                hex::encode(&chain_info.tip_hash),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+
+                share = share_rx.recv() => {
+                    if let Some((nonce, extra_nonce, pow_hash, job_id, block_authorization)) = share {
+                        let submission = ShareSubmission {
+                            job_id: job_id.to_vec(),
+                            nonce,
+                            extra_nonce: extra_nonce.to_vec(),
+                            pow_hash: pow_hash.as_bytes().to_vec(),
+                            block_authorization,
+                        };
+                        let submission_payload = submission.encode_to_vec();
+                        let submission_hash = *primitives::blake3_hash(&submission_payload).as_bytes();
+                        {
+                            let mut pending = state.pending_submission_hashes.write();
+                            if pending.len() >= 4_096 {
+                                return Err("pool left too many share submissions unanswered".into());
+                            }
+                            pending.push_back(submission_hash);
+                        }
+                        let env = PoolEnvelope::sign(
+                            MSG_SUBMIT,
+                            submission_payload,
+                            sk,
+                        );
+                        let data = env.encode_to_vec();
+                        let mut w = write_half.lock().await;
+                        use tokio::io::AsyncWriteExt;
+                        w.write_u32(data.len() as u32).await?;
+                        w.write_all(&data).await?;
+                    }
                 }
             }
         }
     }
-    }.await;
+    .await;
 
     // Abort background tasks so they don't leak on reconnect
     hashrate_handle.abort();
@@ -534,7 +631,7 @@ async fn read_envelope_from(
     use tokio::io::AsyncReadExt;
     let mut r = reader.lock().await;
     let len = r.read_u32().await?;
-    if len > 64 * 1024 * 1024 {
+    if len > 1024 * 1024 {
         return Err(PoolError::Internal(format!("frame too large: {len} bytes")));
     }
     let mut buf = vec![0u8; len as usize];
@@ -547,23 +644,75 @@ fn handle_new_job(
     template: &JobTemplate,
     cfg: &ChainConfig,
     state: &Arc<MinerState>,
+    miner_pubkey: [u8; 32],
+    payout_keys: &[u8],
+    allow_shared_reward_recipient: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let header: BlockHeader = bincode::deserialize(&template.header_data)?;
 
-    let mut job_id = [0u8; 32];
-    if template.job_id.len() == 32 {
-        job_id.copy_from_slice(&template.job_id);
+    if template.job_id.len() != 32 {
+        return Err("job id must be exactly 32 bytes".into());
+    }
+    if template.epoch_seed.len() != 32 {
+        return Err("epoch seed must be exactly 32 bytes".into());
+    }
+    if template.share_difficulty == 0 || template.block_difficulty == 0 {
+        return Err("job difficulty must be greater than zero".into());
+    }
+    if template.consensus_params_hash.as_slice() != cfg.consensus_params_hash()
+        || template.genesis_hash.as_slice() != cfg.genesis_hash()
+    {
+        return Err("pool sent a job for an incompatible chain identity".into());
+    }
+    if template.reward_view_public.len() != 32 || template.reward_spend_public.len() != 32 {
+        return Err("job reward keys must both be exactly 32 bytes".into());
+    }
+    if payout_keys.len() != 64 {
+        return Err("local payout keys must be exactly 64 bytes".into());
+    }
+    let mut reward_view_public = [0u8; 32];
+    reward_view_public.copy_from_slice(&template.reward_view_public);
+    let mut reward_spend_public = [0u8; 32];
+    reward_spend_public.copy_from_slice(&template.reward_spend_public);
+    if reward_view_public == [0u8; 32] || reward_spend_public == [0u8; 32] {
+        return Err("pool supplied a zero reward key".into());
+    }
+    if !allow_shared_reward_recipient
+        && (reward_view_public != payout_keys[..32] || reward_spend_public != payout_keys[32..64])
+    {
+        return Err(
+            "pool redirected the reward address; use --allow-shared-reward-recipient only after reviewing the pool policy"
+                .into(),
+        );
+    }
+    if header.version != FROZEN_BLOCK_VERSION
+        || header.height != template.height
+        || header.difficulty != template.block_difficulty
+        || header.epoch_seed.as_bytes() != template.epoch_seed.as_slice()
+        || header.miner_pubkey != miner_pubkey
+    {
+        return Err("job header metadata mismatch".into());
+    }
+    if compute_tx_root(&template.transactions) != header.tx_root {
+        return Err("job transaction list does not match the committed tx_root".into());
     }
 
-    let mut epoch_seed = Hash256::ZERO;
-    if template.epoch_seed.len() == 32 {
-        epoch_seed = Hash256::from_bytes(template.epoch_seed.clone().try_into().unwrap());
-    }
+    let mut job_id = [0u8; 32];
+    job_id.copy_from_slice(&template.job_id);
+
+    let epoch_seed = Hash256::from_bytes(template.epoch_seed.clone().try_into().unwrap());
 
     let (arena_size, page_size) = if template.arena_params.is_empty() {
         (cfg.arena_size, cfg.page_size)
     } else {
         let params: ArenaParamsData = bincode::deserialize(&template.arena_params)?;
+        if params.arena_size != cfg.arena_size as u64 || params.page_size != cfg.page_size as u64 {
+            return Err(format!(
+                "pool sent incompatible arena parameters: {}/{} (expected {}/{})",
+                params.arena_size, params.page_size, cfg.arena_size, cfg.page_size,
+            )
+            .into());
+        }
         (params.arena_size as usize, params.page_size as usize)
     };
 
@@ -574,6 +723,8 @@ fn handle_new_job(
         epoch_seed,
         arena_size,
         page_size,
+        reward_view_public,
+        reward_spend_public,
     });
 
     state
@@ -597,7 +748,7 @@ fn handle_new_job(
     Ok(())
 }
 
-type ShareResult = (u64, [u8; 32], Hash256, [u8; 32]);
+type ShareResult = (u64, [u8; 32], Hash256, [u8; 32], Vec<u8>);
 
 fn start_mining_threads(
     threads: usize,
@@ -605,6 +756,7 @@ fn start_mining_threads(
     state: Arc<MinerState>,
     batch_size: u64,
     conn_gen: u64,
+    miner_secret: SecretKey,
 ) -> tokio::sync::mpsc::UnboundedReceiver<ShareResult> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -612,9 +764,19 @@ fn start_mining_threads(
         let cfg = cfg.clone();
         let state = Arc::clone(&state);
         let tx = tx.clone();
+        let miner_secret = miner_secret.clone();
 
         std::thread::spawn(move || {
-            mining_thread(thread_id, threads, cfg, state, tx, batch_size, conn_gen);
+            mining_thread(
+                thread_id,
+                threads,
+                cfg,
+                state,
+                tx,
+                batch_size,
+                conn_gen,
+                miner_secret,
+            );
         });
     }
 
@@ -629,6 +791,7 @@ fn mining_thread(
     tx: tokio::sync::mpsc::UnboundedSender<ShareResult>,
     batch_size: u64,
     conn_gen: u64,
+    miner_secret: SecretKey,
 ) {
     info!("Mining thread {thread_id}/{thread_count} started (batch_size={batch_size})");
 
@@ -661,6 +824,7 @@ fn mining_thread(
 
         let share_diff = state.current_share_difficulty.load(Ordering::Acquire);
         let share_target = difficulty_to_target(share_diff);
+        let block_target = difficulty_to_target(job.header.difficulty);
 
         // Pre-compute epoch kernel params once per job (same epoch → same params)
         let epoch = EpochKernelParams::derive(arena.params.epoch_seed.as_bytes());
@@ -693,12 +857,54 @@ fn mining_thread(
                     "Thread {thread_id}: share found nonce={nonce} hash={}",
                     hash
                 );
-                let _ = tx.send((nonce, extra_nonce, hash, job.job_id));
+                let block_authorization = if hash_below_target(&hash, &block_target) {
+                    match BlockAuthorization::sign(
+                        &candidate,
+                        &cfg,
+                        job.reward_view_public,
+                        job.reward_spend_public,
+                        &miner_secret,
+                    )
+                    .and_then(|authorization| {
+                        bincode::serialize(&authorization).map_err(|error| error.to_string())
+                    }) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            error!("refusing unsigned block solution: {error}");
+                            continue;
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                let _ = tx.send((nonce, extra_nonce, hash, job.job_id, block_authorization));
             }
         }
     }
 
     info!("Mining thread {thread_id} stopped");
+}
+
+fn compute_tx_root(transactions: &[Vec<u8>]) -> Hash256 {
+    if transactions.is_empty() {
+        return Hash256::ZERO;
+    }
+    let mut level: Vec<Hash256> = transactions
+        .iter()
+        .map(|transaction| primitives::blake3_hash(transaction))
+        .collect();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            next.push(if pair.len() == 2 {
+                primitives::blake3_hash_many(&[pair[0].as_bytes(), pair[1].as_bytes()])
+            } else {
+                pair[0]
+            });
+        }
+        level = next;
+    }
+    level[0]
 }
 
 fn hash_below_target(hash: &Hash256, target: &[u8; 32]) -> bool {
@@ -710,4 +916,129 @@ fn hash_below_target(hash: &Hash256, target: &[u8; 32]) -> bool {
         }
     }
     true
+}
+
+fn verify_share_receipt(
+    envelope: &PoolEnvelope,
+    state: &Arc<MinerState>,
+    pool_pubkey: &[u8; 32],
+    miner_pubkey: &[u8; 32],
+    submission_hash: &[u8; 32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_sequence = state
+        .receipt_sequence
+        .load(Ordering::Acquire)
+        .saturating_add(1);
+    let previous = *state.receipt_head.read();
+    let result_hash = *primitives::blake3_hash(&envelope.payload).as_bytes();
+    let expected_receipt = share_receipt_hash(
+        pool_pubkey,
+        miner_pubkey,
+        expected_sequence,
+        &previous,
+        submission_hash,
+        &result_hash,
+    );
+    if envelope.receipt_sequence != expected_sequence
+        || envelope.previous_receipt_hash.as_slice() != previous
+        || envelope.receipt_hash.len() != 32
+        || envelope.receipt_hash.as_slice() != expected_receipt
+    {
+        return Err("pool returned a discontinuous or malformed signed share receipt".into());
+    }
+    let mut receipt = [0u8; 32];
+    receipt.copy_from_slice(&envelope.receipt_hash);
+    *state.receipt_head.write() = receipt;
+    state
+        .receipt_sequence
+        .store(expected_sequence, Ordering::Release);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn accepted_receipt(
+        state: &Arc<MinerState>,
+        pool_pubkey: &[u8; 32],
+        miner_pubkey: &[u8; 32],
+        submission_hash: &[u8; 32],
+    ) -> PoolEnvelope {
+        let payload = SubmitResult {
+            accepted: true,
+            error: String::new(),
+            block_found: false,
+            block_hash: Vec::new(),
+        }
+        .encode_to_vec();
+        let result_hash = *primitives::blake3_hash(&payload).as_bytes();
+        let previous = *state.receipt_head.read();
+        let sequence = state.receipt_sequence.load(Ordering::Acquire) + 1;
+        let receipt = share_receipt_hash(
+            pool_pubkey,
+            miner_pubkey,
+            sequence,
+            &previous,
+            submission_hash,
+            &result_hash,
+        );
+        PoolEnvelope {
+            msg_type: MSG_SUBMIT_RESULT,
+            payload,
+            sender_pubkey: pool_pubkey.to_vec(),
+            signature: vec![0u8; 64],
+            timestamp: 0,
+            nonce: 0,
+            receipt_sequence: sequence,
+            previous_receipt_hash: previous.to_vec(),
+            receipt_hash: receipt.to_vec(),
+        }
+    }
+
+    #[test]
+    fn miner_recomputes_and_chains_accepted_share_receipts() {
+        let state = Arc::new(MinerState::new());
+        let pool_pubkey = [41u8; 32];
+        let miner_pubkey = [42u8; 32];
+        let first_submission = [43u8; 32];
+        let first = accepted_receipt(&state, &pool_pubkey, &miner_pubkey, &first_submission);
+        verify_share_receipt(
+            &first,
+            &state,
+            &pool_pubkey,
+            &miner_pubkey,
+            &first_submission,
+        )
+        .unwrap();
+        assert_eq!(state.receipt_sequence.load(Ordering::Acquire), 1);
+
+        let second_submission = [44u8; 32];
+        let second = accepted_receipt(&state, &pool_pubkey, &miner_pubkey, &second_submission);
+        verify_share_receipt(
+            &second,
+            &state,
+            &pool_pubkey,
+            &miner_pubkey,
+            &second_submission,
+        )
+        .unwrap();
+        assert_eq!(state.receipt_sequence.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn miner_rejects_receipt_for_a_different_submission() {
+        let state = Arc::new(MinerState::new());
+        let pool_pubkey = [51u8; 32];
+        let miner_pubkey = [52u8; 32];
+        let submitted = [53u8; 32];
+        let envelope = accepted_receipt(&state, &pool_pubkey, &miner_pubkey, &submitted);
+        let substituted = [54u8; 32];
+
+        assert!(
+            verify_share_receipt(&envelope, &state, &pool_pubkey, &miner_pubkey, &substituted,)
+                .is_err()
+        );
+        assert_eq!(state.receipt_sequence.load(Ordering::Acquire), 0);
+    }
 }
