@@ -247,11 +247,6 @@ fn div_wide(high: u128, low: u128, divisor: u128) -> (u128, u128) {
     (quotient, remainder)
 }
 
-pub fn evaluate_pow(header: &BlockHeader, arena: &EpochArena, cfg: &ChainConfig) -> Hash256 {
-    let epoch = EpochKernelParams::derive(arena.params.epoch_seed.as_bytes());
-    evaluate_pow_with_epoch(header, arena, cfg, &epoch)
-}
-
 pub fn evaluate_pow_with_epoch(
     header: &BlockHeader,
     arena: &EpochArena,
@@ -267,7 +262,7 @@ pub fn evaluate_pow_with_epoch(
         let page_index = scratchpad.next_page(page_count);
         let page = arena.page(page_index);
         let kernel_id = scratchpad.select_kernel(page[32], cfg.kernel_count);
-        let kernel_out = execute_kernel(kernel_id, page, &scratchpad.state, &epoch);
+        let kernel_out = execute_kernel(kernel_id, page, &scratchpad.state, epoch);
         scratchpad.mix_state(&kernel_out);
 
         let write_pos =

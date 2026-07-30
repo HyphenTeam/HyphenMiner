@@ -218,43 +218,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(MinerState::new());
 
-    let wallet_pubkey = if cli.wallet_address.starts_with("hy1") {
-        let encoded = &cli.wallet_address[3..];
-        let payload = bs58::decode(encoded)
-            .into_vec()
-            .expect("--wallet_address: invalid hy1 address base58");
-        // payload = version(1) + view_pub(32) + spend_pub(32) + checksum(4) = 69
-        if payload.len() != 69 {
-            eprintln!(
-                "Error: invalid hy1 address length: expected 69 decoded bytes, got {}",
-                payload.len()
-            );
-            std::process::exit(1);
-        }
-        let expected_version = if cfg.network_magic == [0x48, 0x59, 0x50, 0x4e] {
-            0x01
-        } else {
-            0x02
-        };
-        if payload[0] != expected_version {
-            eprintln!("Error: wallet address belongs to a different Hyphen network");
-            std::process::exit(1);
-        }
-        let checksum = &payload[65..69];
-        let hash = blake3::hash(&payload[..65]);
-        if checksum != &hash.as_bytes()[..4] {
-            eprintln!("Error: hy1 address checksum mismatch");
-            std::process::exit(1);
-        }
-        // Return view_public (32) + spend_public (32) = 64 bytes
-        payload[1..65].to_vec()
-    } else {
-        return Err("pool protocol v3 requires --wallet-address with a hy1... address".into());
-    };
-    if wallet_pubkey.len() != 64 {
-        return Err("wallet address must decode to 64 view/spend public-key bytes".into());
-    }
-    info!("Payout wallet: {}", hex::encode(&wallet_pubkey));
+    let wallet_pubkey = parse_wallet_address(&cli.wallet_address, &cfg)?;
+    info!("Payout wallet: {}", hex::encode(wallet_pubkey));
 
     let mut backoff_secs = 5u64;
     loop {
@@ -292,6 +257,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn parse_wallet_address(address: &str, cfg: &ChainConfig) -> Result<[u8; 64], String> {
+    let encoded = address.strip_prefix("hy1").ok_or_else(|| {
+        "pool protocol v3 requires --wallet-address with a hy1... address".to_string()
+    })?;
+    let payload = bs58::decode(encoded)
+        .into_vec()
+        .map_err(|_| "wallet address contains invalid base58".to_string())?;
+    if payload.len() != 69 {
+        return Err(format!(
+            "invalid wallet address length: expected 69 decoded bytes, got {}",
+            payload.len()
+        ));
+    }
+    let expected_version = if cfg.network_magic == [0x48, 0x59, 0x50, 0x4e] {
+        0x01
+    } else {
+        0x02
+    };
+    if payload[0] != expected_version {
+        return Err("wallet address belongs to a different Hyphen network".into());
+    }
+    let hash = blake3::hash(&payload[..65]);
+    if payload[65..69] != hash.as_bytes()[..4] {
+        return Err("wallet address checksum mismatch".into());
+    }
+    payload[1..65]
+        .try_into()
+        .map_err(|_| "wallet address payload is malformed".to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -750,6 +745,15 @@ fn handle_new_job(
 
 type ShareResult = (u64, [u8; 32], Hash256, [u8; 32], Vec<u8>);
 
+struct MiningThreadConfig {
+    thread_id: usize,
+    thread_count: usize,
+    chain: ChainConfig,
+    batch_size: u64,
+    connection_generation: u64,
+    miner_secret: SecretKey,
+}
+
 fn start_mining_threads(
     threads: usize,
     cfg: ChainConfig,
@@ -768,14 +772,16 @@ fn start_mining_threads(
 
         std::thread::spawn(move || {
             mining_thread(
-                thread_id,
-                threads,
-                cfg,
+                MiningThreadConfig {
+                    thread_id,
+                    thread_count: threads,
+                    chain: cfg,
+                    batch_size,
+                    connection_generation: conn_gen,
+                    miner_secret,
+                },
                 state,
                 tx,
-                batch_size,
-                conn_gen,
-                miner_secret,
             );
         });
     }
@@ -784,15 +790,18 @@ fn start_mining_threads(
 }
 
 fn mining_thread(
-    thread_id: usize,
-    thread_count: usize,
-    cfg: ChainConfig,
+    config: MiningThreadConfig,
     state: Arc<MinerState>,
     tx: tokio::sync::mpsc::UnboundedSender<ShareResult>,
-    batch_size: u64,
-    conn_gen: u64,
-    miner_secret: SecretKey,
 ) {
+    let MiningThreadConfig {
+        thread_id,
+        thread_count,
+        chain: cfg,
+        batch_size,
+        connection_generation: conn_gen,
+        miner_secret,
+    } = config;
     info!("Mining thread {thread_id}/{thread_count} started (batch_size={batch_size})");
 
     #[allow(unused_assignments)]
@@ -958,6 +967,31 @@ fn verify_share_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn address_for(cfg: &ChainConfig) -> String {
+        let version = if cfg.network_magic == [0x48, 0x59, 0x50, 0x4e] {
+            0x01
+        } else {
+            0x02
+        };
+        let mut payload = vec![version];
+        payload.extend_from_slice(&[11u8; 32]);
+        payload.extend_from_slice(&[12u8; 32]);
+        let hash = blake3::hash(&payload);
+        payload.extend_from_slice(&hash.as_bytes()[..4]);
+        format!("hy1{}", bs58::encode(payload).into_string())
+    }
+
+    #[test]
+    fn wallet_address_parser_returns_errors_instead_of_panicking() {
+        let cfg = ChainConfig::devnet();
+        assert!(parse_wallet_address(&address_for(&cfg), &cfg).is_ok());
+        assert!(parse_wallet_address("hy1not-base58-0OIl", &cfg).is_err());
+        assert!(parse_wallet_address("hy1", &cfg).is_err());
+
+        let mainnet_address = address_for(&ChainConfig::mainnet());
+        assert!(parse_wallet_address(&mainnet_address, &cfg).is_err());
+    }
 
     fn accepted_receipt(
         state: &Arc<MinerState>,
