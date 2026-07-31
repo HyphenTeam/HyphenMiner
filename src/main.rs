@@ -1,8 +1,10 @@
+mod accelerator;
 mod pow;
 mod primitives;
 mod protocol;
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -12,6 +14,7 @@ use prost::Message;
 use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
+use accelerator::{AcceleratorRegistry, BackendStatus};
 use pow::{difficulty_to_target, evaluate_pow_with_epoch, EpochArena, EpochKernelParams};
 use primitives::{
     BlockAuthorization, BlockHeader, ChainConfig, Hash256, SecretKey, FROZEN_BLOCK_VERSION,
@@ -25,7 +28,10 @@ struct ArenaParamsData {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "hyphen-miner", about = "Hyphen standalone CPU miner")]
+#[command(
+    name = "hyphen-miner",
+    about = "Hyphen standalone miner with verified native accelerators"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -58,6 +64,14 @@ struct Cli {
     /// settlement wallet. The exact reward keys remain miner-authorized.
     #[arg(long, default_value_t = false)]
     allow_shared_reward_recipient: bool,
+
+    /// Directory containing hyphen_backend_* native accelerator plugins.
+    #[arg(long, default_value = "accelerators")]
+    accelerator_dir: PathBuf,
+
+    /// Refuse to start unless a device passes execution and independent CPU verification.
+    #[arg(long, default_value_t = false)]
+    require_accelerator: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -67,6 +81,26 @@ enum Commands {
         /// Output file path for the 32-byte secret key
         #[arg(long, default_value = "miner.key")]
         output: String,
+    },
+    /// Enumerate plugins and run deterministic device/CPU cross-checks.
+    Accelerators,
+    /// Execute the deterministic diffusion PDE kernel and verify the complete device result.
+    ScientificRun {
+        /// Little-endian i32 input cells. Each cell must be in 0..=262143.
+        #[arg(long)]
+        input: PathBuf,
+        /// Destination for the verified little-endian i32 result.
+        #[arg(long)]
+        output: PathBuf,
+        /// Q12 diffusion coefficient in 0..=2048.
+        #[arg(long, default_value_t = 512)]
+        alpha_q12: u32,
+        /// Number of deterministic evolution steps in 1..=1024.
+        #[arg(long, default_value_t = 1)]
+        iterations: u32,
+        /// Restrict execution to a backend such as nvidia-cuda or intel-openvino.
+        #[arg(long, default_value = "")]
+        backend: String,
     },
 }
 
@@ -173,6 +207,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if matches!(cli.command, Some(Commands::Accelerators)) {
+        let registry = AcceleratorRegistry::discover(&cli.accelerator_dir);
+        print_accelerator_reports(&registry);
+        if cli.require_accelerator && registry.available_devices() == 0 {
+            return Err("no accelerator passed the deterministic device self-test".into());
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::ScientificRun {
+        input,
+        output,
+        alpha_q12,
+        iterations,
+        backend,
+    }) = &cli.command
+    {
+        let input_bytes = std::fs::read(input)?;
+        if !input_bytes.len().is_multiple_of(std::mem::size_of::<i32>()) {
+            return Err("scientific input length must be a multiple of four bytes".into());
+        }
+        let cells = input_bytes
+            .chunks_exact(std::mem::size_of::<i32>())
+            .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("exact chunk size")))
+            .collect::<Vec<_>>();
+        let registry = AcceleratorRegistry::discover(&cli.accelerator_dir);
+        let execution = registry.execute_verified(
+            (!backend.is_empty()).then_some(backend.as_str()),
+            &cells,
+            *alpha_q12,
+            *iterations,
+        )?;
+        let mut output_bytes =
+            Vec::with_capacity(std::mem::size_of_val(execution.output.as_slice()));
+        for value in &execution.output {
+            output_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(output, output_bytes)?;
+        println!("Verified scientific device execution:");
+        println!("  backend          : {}", execution.backend);
+        println!("  device           : {}", execution.device);
+        println!("  stable device ID : {}", execution.stable_id);
+        println!("  input commitment : {}", execution.input_commitment);
+        println!("  output commitment: {}", execution.output_commitment);
+        println!("  operation count  : {}", execution.operation_count);
+        println!("  device time (ns) : {}", execution.device_time_ns);
+        println!("  verified output  : {}", output.display());
+        return Ok(());
+    }
+
     let cfg = match cli.network.as_str() {
         "mainnet" => ChainConfig::mainnet(),
         "testnet" => ChainConfig::testnet(),
@@ -212,9 +296,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!(
-        "Hyphen Miner starting – pool={}, threads={}, network={}",
+        "Hyphen Miner starting: pool={}, threads={}, network={}",
         cli.pool, threads, cfg.network_name
     );
+
+    let accelerators = AcceleratorRegistry::discover(&cli.accelerator_dir);
+    log_accelerator_reports(&accelerators);
+    if cli.require_accelerator && accelerators.available_devices() == 0 {
+        return Err("no accelerator passed the deterministic device self-test".into());
+    }
 
     let state = Arc::new(MinerState::new());
 
@@ -257,6 +347,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn print_accelerator_reports(registry: &AcceleratorRegistry) {
+    println!(
+        "Native accelerator backends: {} loaded, {} verified devices",
+        registry.loaded_backend_count(),
+        registry.available_devices()
+    );
+    for report in registry.reports() {
+        let device = if report.name.is_empty() {
+            "-".to_string()
+        } else {
+            format!("{} ({})", report.name, report.stable_id)
+        };
+        let runtime = if report.runtime.is_empty() {
+            "-"
+        } else {
+            &report.runtime
+        };
+        println!(
+            "  {:<18} {:<24} runtime={:<16} {}",
+            report.backend, device, runtime, report.status
+        );
+        if let (Some(operations), Some(device_time_ns)) =
+            (report.operation_count, report.device_time_ns)
+        {
+            println!(
+                "    verified operations={operations}, device_time_ns={device_time_ns}, vendor={}",
+                report.vendor
+            );
+        }
+    }
+}
+
+fn log_accelerator_reports(registry: &AcceleratorRegistry) {
+    for report in registry.reports() {
+        match &report.status {
+            BackendStatus::Available => info!(
+                "accelerator verified: backend={}, device={}, stable_id={}, runtime={}, operations={}, device_time_ns={}",
+                report.backend,
+                report.name,
+                report.stable_id,
+                report.runtime,
+                report.operation_count.unwrap_or(0),
+                report.device_time_ns.unwrap_or(0)
+            ),
+            BackendStatus::Unavailable(reason) => {
+                info!("accelerator unavailable: backend={}, reason={reason}", report.backend)
+            }
+            BackendStatus::SelfTestFailed(reason) => warn!(
+                "accelerator self-test failed: backend={}, device={}, reason={reason}",
+                report.backend, report.name
+            ),
+        }
+    }
 }
 
 fn parse_wallet_address(address: &str, cfg: &ChainConfig) -> Result<[u8; 64], String> {
@@ -317,7 +462,7 @@ async fn connect_and_mine(
             .with_time(std::time::Duration::from_secs(30))
             .with_interval(std::time::Duration::from_secs(10));
         sock.set_tcp_keepalive(&keepalive)?;
-        sock.set_nodelay(true)?;
+        sock.set_tcp_nodelay(true)?;
         let std_sock: std::net::TcpStream = sock.into();
         std_sock.set_nonblocking(true)?;
         stream = TcpStream::from_std(std_sock)?;
@@ -643,7 +788,7 @@ fn handle_new_job(
     payout_keys: &[u8],
     allow_shared_reward_recipient: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let header: BlockHeader = bincode::deserialize(&template.header_data)?;
+    let header: BlockHeader = hyphen_codec::deserialize_with_limit(&template.header_data, 4096)?;
 
     if template.job_id.len() != 32 {
         return Err("job id must be exactly 32 bytes".into());
@@ -700,7 +845,8 @@ fn handle_new_job(
     let (arena_size, page_size) = if template.arena_params.is_empty() {
         (cfg.arena_size, cfg.page_size)
     } else {
-        let params: ArenaParamsData = bincode::deserialize(&template.arena_params)?;
+        let params: ArenaParamsData =
+            hyphen_codec::deserialize_with_limit(&template.arena_params, 64)?;
         if params.arena_size != cfg.arena_size as u64 || params.page_size != cfg.page_size as u64 {
             return Err(format!(
                 "pool sent incompatible arena parameters: {}/{} (expected {}/{})",
@@ -875,7 +1021,8 @@ fn mining_thread(
                         &miner_secret,
                     )
                     .and_then(|authorization| {
-                        bincode::serialize(&authorization).map_err(|error| error.to_string())
+                        hyphen_codec::serialize_with_limit(&authorization, 256)
+                            .map_err(|error| error.to_string())
                     }) {
                         Ok(encoded) => encoded,
                         Err(error) => {

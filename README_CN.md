@@ -1,12 +1,25 @@
+# Hyphen Miner (Chinese Compatibility Entry)
+
+This compatibility entry preserves the Chinese documentation URL. The complete
+English-first, Chinese-second README is available in [README.md](README.md).
+
+---
+
+<!-- hyphen-bilingual-chinese -->
+
 # Hyphen Miner
 
 [English](README.md)
 
-Hyphen Miner 是独立的 CPU 矿工仓库。它连接 Hyphen Pool Protocol v3，验证链身份和工作模板，执行内存型 PoW，提交 share，并且只在结果同时满足区块难度时生成矿工出块授权。
+Hyphen Miner 是独立矿工和原生科学加速器宿主。它连接 Hyphen Pool Protocol v3、验证 PoW 工作模板，并通过版本化 C ABI 加载 CUDA、HIP、OpenVINO 和 QNN 插件，厂商 SDK 不进入面向共识的 Rust 进程。
 
 ## 当前真实能力
 
-已经实现多线程挖矿、epoch arena 共享、断线退避重连、VarDiff、签名消息、奖励地址约束、交易根复算、完整区块授权和签名 share 回执链。Useful-Work 没有开启；没有 GPU 后端；矿工还不能自主从节点选交易并向池声明工作；池拒绝时也没有直接向节点提交的兜底。
+已经实现多线程挖矿、epoch arena 共享、断线退避重连、VarDiff、签名消息、奖励地址约束、交易根复算、完整区块授权和签名 share 回执链。原生加速器 ABI 已实现有界、确定性的 Q12 扩散/PDE 算子；每次设备输出返回前都会由独立 Rust 实现完整复算。
+
+NVIDIA CUDA 已在当前开发机实机验证。AMD HIP 与 Intel OpenVINO NPU/GPU 是条件构建后端；缺 SDK 或硬件时明确显示 `unavailable`。QNN 插件会真实初始化 HTP provider/device，但在目标 SoC 的确定性 graph package 未安装前不公布计算能力，不能进入调度。
+
+Pool v3 仍未实现科研任务分发，矿工也尚未提交 `hyphen-compute` 结果 envelope；生产科研 circuit/verifier key 仍不存在。因此本地设备正确执行不是 SNARK，也不是已完成的链上 PoUW 结算。
 
 因此当前准确结论是：矿工能检测池在发出 job 以后替换交易列表、奖励地址或 header，但 Pool v3 的交易集合仍由池选择，不能声称已经消灭交易审查和 MEV。
 
@@ -15,6 +28,7 @@ Hyphen Miner 是独立的 CPU 矿工仓库。它连接 Hyphen Pool Protocol v3�
 ```powershell
 cargo build --release --locked
 cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
 .\target\release\hyphen-miner.exe keygen --output .\miner.key
 ```
 
@@ -29,6 +43,56 @@ cargo test --locked
 ```
 
 `--threads 0` 使用全部逻辑 CPU。mainnet 研究配置拒绝临时身份。只有在你明确接受共享池把 coinbase 指向结算钱包时，才使用 `--allow-shared-reward-recipient`。
+
+## 原生科学加速器
+
+只构建本机已经安装 SDK 的后端，插件输出到 `accelerators/`：
+
+```powershell
+cmake -S native -B native/build-cuda -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DHYPHEN_ENABLE_CUDA=ON
+cmake --build native/build-cuda --config Release
+
+cmake -S native -B native/build-openvino -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DHYPHEN_ENABLE_OPENVINO=ON `
+  -DOpenVINO_DIR='<openvino-runtime>/cmake'
+
+cmake -S native -B native/build-hip -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DHYPHEN_ENABLE_HIP=ON
+
+cmake -S native -B native/build-qnn -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DHYPHEN_ENABLE_QNN=ON `
+  -DQNN_SDK_ROOT='D:/Qualcomm AI Engine Direct SDK'
+```
+
+枚举设备并执行设备端/CPU 已知答案交叉验证：
+
+```powershell
+.\target\release\hyphen-miner.exe `
+  --accelerator-dir .\accelerators `
+  accelerators
+```
+
+`available`、`unavailable`、`self-test failed` 是三个不同状态。加入 `--require-accelerator` 后，没有设备通过真实设备执行、逐字节复算和操作数检查时，Miner 会拒绝启动。
+
+执行并完整复核科研算子。输入和输出均为小端 `i32` 数组，v1 至少需要三个 `0..=262143` 的单元：
+
+```powershell
+.\target\release\hyphen-miner.exe `
+  --accelerator-dir .\accelerators `
+  scientific-run `
+  --backend nvidia-cuda `
+  --input .\cells.i32le `
+  --output .\evolved.i32le `
+  --alpha-q12 512 `
+  --iterations 64
+```
+
+只有完整输出与 Rust 一致后，命令才打印域分离的输入/输出 commitment、稳定设备 ID、操作数和设备耗时。这是确定性执行验证，不是 ZK/SNARK 证明。
 
 ## 模板验证
 

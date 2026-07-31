@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Hyphen Contributors"]
 license = "AGPL-3.0"
-description = "Standalone CPU miner for the Hyphen blockchain"
+description = "Standalone Hyphen miner with verified native accelerator backends"
 
 [workspace]
 
@@ -13,20 +13,21 @@ name = "hyphen-miner"
 path = "src/main.rs"
 
 [dependencies]
-bincode = "1"
-blake3 = "1.8"
+blake3 = "1.8.5"
 bs58 = "0.5"
-chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
-ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.4", features = ["derive"] }
+ed25519-dalek = { version = "3.0.0", features = ["serde", "rand_core"] }
 hex = { version = "0.4", features = ["serde"] }
+hyphen-codec = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "3a7effdc74b59bea1792116327e569e1d9bc9e21" }
+libloading = "0.9"
 parking_lot = "0.12"
-prost = "0.13"
-rand = "0.8"
-serde = { version = "1", features = ["derive"] }
-socket2 = "0.5"
-thiserror = "1"
-tokio = { version = "1", features = ["full"] }
+prost = "0.14.4"
+rand = "0.10.2"
+serde = { version = "1.0.229", features = ["derive"] }
+socket2 = "0.6.5"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1.9.0", features = ["derive"] }

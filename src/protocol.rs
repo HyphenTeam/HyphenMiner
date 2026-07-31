@@ -114,10 +114,10 @@ impl PoolEnvelope {
         pk.verify(&sign_data, &sig)
             .map_err(|_| PoolError::SignatureVerificationFailed)?;
         let now = chrono::Utc::now().timestamp() as u64;
-        if self.timestamp > now + 30 {
+        if self.timestamp > now.saturating_add(30) {
             return Err(PoolError::MessageFromFuture);
         }
-        if now > self.timestamp + 120 {
+        if now > self.timestamp.saturating_add(120) {
             return Err(PoolError::MessageExpired);
         }
         Ok(())
@@ -354,5 +354,44 @@ impl PoolCodec {
         stream.write_u32(data.len() as u32).await?;
         stream.write_all(&data).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_envelope_handles_max_timestamp_without_overflow() {
+        let secret = SecretKey([20u8; 32]);
+        let public = *secret.public_key().as_bytes();
+        let payload = vec![7u8];
+        let timestamp = u64::MAX;
+        let nonce = 9;
+        let sign_data = PoolEnvelope::sign_payload(
+            MSG_KEEPALIVE,
+            &payload,
+            &public,
+            timestamp,
+            nonce,
+            0,
+            &[],
+            &[],
+        );
+        let envelope = PoolEnvelope {
+            msg_type: MSG_KEEPALIVE,
+            payload,
+            sender_pubkey: public.to_vec(),
+            signature: secret.sign(&sign_data).as_bytes().to_vec(),
+            timestamp,
+            nonce,
+            receipt_sequence: 0,
+            previous_receipt_hash: Vec::new(),
+            receipt_hash: Vec::new(),
+        };
+        assert!(matches!(
+            envelope.verify(),
+            Err(PoolError::MessageFromFuture)
+        ));
     }
 }
