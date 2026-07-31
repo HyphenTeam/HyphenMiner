@@ -170,12 +170,12 @@ availability or proof that the pool is solvent.
 
 ## Protocol compatibility
 
-Consensus-facing types and `hyphen-codec` are pinned to the public Hyphen Git
-revision `3a7effdc74b59bea1792116327e569e1d9bc9e21`. The miner has no local path
-dependency on a sibling Hyphen checkout. Changing that revision is a protocol
-upgrade and requires the fixed codec vector, all three chain-identity vectors,
-tests, strict Clippy and a release build to pass. Do not add a legacy decoder to
-hash, signature or authorization paths.
+Consensus-facing local types must remain synchronized with the main chain.
+Binary encoding uses RustBinary 0.1.2 with the same bounded, fixed-width,
+little-endian, trailing-byte-rejecting profile as Hyphen. A protocol change
+requires the fixed wire vector, all three chain-identity vectors, tests, strict
+Clippy and a release build to pass. Do not add format fallback to hash,
+signature or authorization paths.
 
 ## CI and releases
 
@@ -317,10 +317,10 @@ r_i=H_d(pool_pk,miner_pk,i,r_(i-1),H(submission_i),H(result_i)).
 
 ## 协议兼容性
 
-面向共识的类型和 `hyphen-codec` 固定到 Hyphen 公开 Git revision
-`3a7effdc74b59bea1792116327e569e1d9bc9e21`，Miner 不依赖相邻主链检出的本地路径。
-改变该 revision 属于协议升级，必须重新通过 codec 固定向量、三套链身份向量、测试、
-严格 Clippy 和 release 构建。不得在哈希、签名或授权路径中加入旧格式回退解码。
+面向共识的本地类型必须与 Hyphen 主链保持同步。二进制编码使用 RustBinary 0.1.2，
+配置与主链相同：有界、固定宽度、小端并拒绝尾随字节。协议变更必须重新通过 wire
+固定向量、三套链身份向量、测试、严格 Clippy 和 release 构建。不得在哈希、签名或
+授权路径中加入格式回退解码。
 
 ## CI 和 Release
 
@@ -330,4 +330,4 @@ CI 执行格式、严格 Clippy、测试和锁定依赖的 release build。只�
 
 ## 许可证
 
-HyphenMiner 使用 GNU Affero General Public License v3.0，完整条款见 [LICENSE](LICENSE)。
+HyphenMiner 使用 PolyForm Strict License 1.0.0，完整条款见 [LICENSE](LICENSE)。

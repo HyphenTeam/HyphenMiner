@@ -3,6 +3,18 @@ mod pow;
 mod primitives;
 mod protocol;
 
+const DEFAULT_WIRE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_WIRE_COLLECTION_ITEMS: usize = 1_000_000;
+
+fn wire_config(max_bytes: usize) -> rustbinary::Config {
+    rustbinary::legacy_options()
+        .with_little_endian()
+        .with_fixint_encoding()
+        .with_limit(max_bytes as u64)
+        .with_collection_limit(max_bytes.min(MAX_WIRE_COLLECTION_ITEMS) as u64)
+        .reject_trailing_bytes()
+}
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -788,7 +800,7 @@ fn handle_new_job(
     payout_keys: &[u8],
     allow_shared_reward_recipient: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let header: BlockHeader = hyphen_codec::deserialize_with_limit(&template.header_data, 4096)?;
+    let header: BlockHeader = wire_config(4096).deserialize(&template.header_data)?;
 
     if template.job_id.len() != 32 {
         return Err("job id must be exactly 32 bytes".into());
@@ -845,8 +857,7 @@ fn handle_new_job(
     let (arena_size, page_size) = if template.arena_params.is_empty() {
         (cfg.arena_size, cfg.page_size)
     } else {
-        let params: ArenaParamsData =
-            hyphen_codec::deserialize_with_limit(&template.arena_params, 64)?;
+        let params: ArenaParamsData = wire_config(64).deserialize(&template.arena_params)?;
         if params.arena_size != cfg.arena_size as u64 || params.page_size != cfg.page_size as u64 {
             return Err(format!(
                 "pool sent incompatible arena parameters: {}/{} (expected {}/{})",
@@ -1021,7 +1032,8 @@ fn mining_thread(
                         &miner_secret,
                     )
                     .and_then(|authorization| {
-                        hyphen_codec::serialize_with_limit(&authorization, 256)
+                        wire_config(256)
+                            .serialize(&authorization)
                             .map_err(|error| error.to_string())
                     }) {
                         Ok(encoded) => encoded,

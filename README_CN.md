@@ -132,4 +132,4 @@ CI 执行格式、严格 Clippy、测试和锁定依赖的 release build。只�
 
 ## 许可证
 
-HyphenMiner 使用 GNU Affero General Public License v3.0，完整条款见 [LICENSE](LICENSE)。
+HyphenMiner 使用 PolyForm Strict License 1.0.0，完整条款见 [LICENSE](LICENSE)。
