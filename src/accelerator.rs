@@ -8,17 +8,17 @@ use std::time::Instant;
 
 use libloading::{Library, Symbol};
 
-const ABI_VERSION: u32 = 1;
-const KERNEL_DIFFUSION_Q12_V1: u32 = 1;
-const CAP_DIFFUSION_Q12_V1: u64 = 1;
+const ABI_VERSION: u32 = 2;
+const KERNEL_DIFFUSION_2D_Q12_V1: u32 = 2;
+const CAP_DIFFUSION_2D_Q12_V1: u64 = 1 << 1;
+const POUW_GRID_SIDE: usize = 64;
+const POUW_CELL_COUNT: usize = POUW_GRID_SIDE * POUW_GRID_SIDE;
+const MAX_POUW_ITERATIONS: u32 = 4_096;
+const OPERATIONS_PER_CELL: u64 = 7;
 const MAX_DEVICES_PER_BACKEND: u32 = 128;
 const MAX_RESULT_BYTES: usize = 512 * 1024 * 1024;
 const SELF_TEST_ALPHA_Q12: u32 = 512;
 const SELF_TEST_ITERATIONS: u32 = 7;
-const SELF_TEST_INPUT: [i32; 16] = [
-    32768, 65536, 98304, 131072, 229376, 196608, 163840, 131072, 98304, 65536, 32768, 16384, 8192,
-    4096, 2048, 1024,
-];
 
 const EXPECTED_BACKENDS: [(&str, &str); 4] = [
     ("nvidia-cuda", "hyphen_backend_cuda"),
@@ -211,7 +211,7 @@ impl AcceleratorRegistry {
         alpha_q12: u32,
         iterations: u32,
     ) -> Result<VerifiedExecution, String> {
-        let expected = diffusion_q12_reference(input, alpha_q12, iterations)?;
+        let expected = diffusion_2d_q12_reference(input, alpha_q12, iterations)?;
         let input_bytes = encode_i32(input);
         let expected_output = encode_i32(&expected);
         let mut failures = Vec::new();
@@ -222,7 +222,7 @@ impl AcceleratorRegistry {
             }
             for device in &backend.devices {
                 if device.hardware_accelerated == 0
-                    || device.capability_mask & CAP_DIFFUSION_Q12_V1 == 0
+                    || device.capability_mask & CAP_DIFFUSION_2D_Q12_V1 == 0
                 {
                     continue;
                 }
@@ -268,7 +268,7 @@ impl AcceleratorRegistry {
         if failures.is_empty() {
             let requested = backend_filter.unwrap_or("any");
             Err(format!(
-                "no verified accelerator supports diffusion-q12-v1 (requested backend: {requested})"
+                "no verified accelerator supports diffusion-2d-q12-v1 (requested backend: {requested})"
             ))
         } else {
             Err(format!(
@@ -384,9 +384,9 @@ impl LoadedBackend {
                 BackendStatus::Unavailable("provider is not hardware accelerated".into());
             return report;
         }
-        if device.capability_mask & CAP_DIFFUSION_Q12_V1 == 0 {
+        if device.capability_mask & CAP_DIFFUSION_2D_Q12_V1 == 0 {
             report.status = BackendStatus::Unavailable(
-                "deterministic diffusion-q12-v1 kernel is unsupported".into(),
+                "deterministic diffusion-2d-q12-v1 kernel is unsupported".into(),
             );
             return report;
         }
@@ -402,14 +402,15 @@ impl LoadedBackend {
     }
 
     fn execute_self_test(&self, device_ordinal: u32) -> Result<(u64, u64), String> {
-        let input = encode_i32(&SELF_TEST_INPUT);
+        let cells = self_test_input();
+        let input = encode_i32(&cells);
         let expected =
-            diffusion_q12_reference(&SELF_TEST_INPUT, SELF_TEST_ALPHA_Q12, SELF_TEST_ITERATIONS)?;
+            diffusion_2d_q12_reference(&cells, SELF_TEST_ALPHA_Q12, SELF_TEST_ITERATIONS)?;
         let (_, operations, device_time_ns) = self.execute_and_check(
             device_ordinal,
             &input,
             &encode_i32(&expected),
-            SELF_TEST_INPUT.len(),
+            cells.len(),
             SELF_TEST_ALPHA_Q12,
             SELF_TEST_ITERATIONS,
         )?;
@@ -427,7 +428,7 @@ impl LoadedBackend {
     ) -> Result<(Vec<i32>, u64, u64), String> {
         let request = ExecuteRequestV1 {
             struct_size: size_of::<ExecuteRequestV1>() as u32,
-            kernel_id: KERNEL_DIFFUSION_Q12_V1,
+            kernel_id: KERNEL_DIFFUSION_2D_Q12_V1,
             device_ordinal,
             iterations,
             alpha_q12,
@@ -462,7 +463,7 @@ impl LoadedBackend {
         }
         let expected_operations = (cell_count as u64)
             .checked_mul(iterations as u64)
-            .and_then(|value| value.checked_mul(6))
+            .and_then(|value| value.checked_mul(OPERATIONS_PER_CELL))
             .ok_or("operation count overflow")?;
         if result.operation_count != expected_operations {
             return Err(format!(
@@ -598,7 +599,8 @@ fn decode_i32(bytes: &[u8]) -> Result<Vec<i32>, String> {
 fn execution_commitment(domain: &[u8], alpha_q12: u32, iterations: u32, data: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
-    hasher.update(&KERNEL_DIFFUSION_Q12_V1.to_le_bytes());
+    hasher.update(&KERNEL_DIFFUSION_2D_Q12_V1.to_le_bytes());
+    hasher.update(&(POUW_GRID_SIDE as u32).to_le_bytes());
     hasher.update(&alpha_q12.to_le_bytes());
     hasher.update(&iterations.to_le_bytes());
     hasher.update(&(data.len() as u64).to_le_bytes());
@@ -606,40 +608,58 @@ fn execution_commitment(domain: &[u8], alpha_q12: u32, iterations: u32, data: &[
     hasher.finalize().to_hex().to_string()
 }
 
-fn diffusion_q12_reference(
+fn diffusion_2d_q12_reference(
     input: &[i32],
     alpha_q12: u32,
     iterations: u32,
 ) -> Result<Vec<i32>, String> {
-    if input.len() < 3 {
-        return Err("diffusion input requires at least three cells".into());
+    if input.len() != POUW_CELL_COUNT {
+        return Err(format!(
+            "diffusion input must contain exactly {POUW_CELL_COUNT} cells"
+        ));
     }
-    if !(1..=1024).contains(&iterations) {
-        return Err("diffusion iterations must be in 1..=1024".into());
+    if !(1..=MAX_POUW_ITERATIONS).contains(&iterations) {
+        return Err(format!(
+            "diffusion iterations must be in 1..={MAX_POUW_ITERATIONS}"
+        ));
     }
-    if alpha_q12 > 2048 {
-        return Err("alpha_q12 must not exceed 2048".into());
+    if alpha_q12 > 1024 {
+        return Err("alpha_q12 must not exceed 1024".into());
     }
     if input.iter().any(|value| !(0..=262_143).contains(value)) {
         return Err("diffusion input cells must be in 0..=262143".into());
     }
 
     let alpha = i64::from(alpha_q12);
-    let center_weight = 4096i64 - 2 * alpha;
+    let center_weight = 4096i64 - 4 * alpha;
     let mut current = input.to_vec();
     let mut next = vec![0i32; input.len()];
     for _ in 0..iterations {
-        for index in 0..current.len() {
-            let left = i64::from(current[(index + current.len() - 1) % current.len()]);
-            let center = i64::from(current[index]);
-            let right = i64::from(current[(index + 1) % current.len()]);
-            let numerator = center_weight * center + alpha * left + alpha * right;
-            next[index] =
-                i32::try_from(numerator / 4096).map_err(|_| "diffusion result exceeds i32")?;
+        for row in 0..POUW_GRID_SIDE {
+            let north = (row + POUW_GRID_SIDE - 1) % POUW_GRID_SIDE;
+            let south = (row + 1) % POUW_GRID_SIDE;
+            for column in 0..POUW_GRID_SIDE {
+                let west = (column + POUW_GRID_SIDE - 1) % POUW_GRID_SIDE;
+                let east = (column + 1) % POUW_GRID_SIDE;
+                let index = row * POUW_GRID_SIDE + column;
+                let neighbours = i64::from(current[north * POUW_GRID_SIDE + column])
+                    + i64::from(current[south * POUW_GRID_SIDE + column])
+                    + i64::from(current[row * POUW_GRID_SIDE + west])
+                    + i64::from(current[row * POUW_GRID_SIDE + east]);
+                let numerator = center_weight * i64::from(current[index]) + alpha * neighbours;
+                next[index] =
+                    i32::try_from(numerator / 4096).map_err(|_| "diffusion result exceeds i32")?;
+            }
         }
         std::mem::swap(&mut current, &mut next);
     }
     Ok(current)
+}
+
+fn self_test_input() -> Vec<i32> {
+    (0..POUW_CELL_COUNT)
+        .map(|index| ((index * 65_537 + 17) & 0x3ffff) as i32)
+        .collect()
 }
 
 #[cfg(test)]
@@ -648,14 +668,13 @@ mod tests {
 
     #[test]
     fn diffusion_reference_is_deterministic_and_bounded() {
+        let input = self_test_input();
         let first =
-            diffusion_q12_reference(&SELF_TEST_INPUT, SELF_TEST_ALPHA_Q12, SELF_TEST_ITERATIONS)
-                .unwrap();
+            diffusion_2d_q12_reference(&input, SELF_TEST_ALPHA_Q12, SELF_TEST_ITERATIONS).unwrap();
         let second =
-            diffusion_q12_reference(&SELF_TEST_INPUT, SELF_TEST_ALPHA_Q12, SELF_TEST_ITERATIONS)
-                .unwrap();
+            diffusion_2d_q12_reference(&input, SELF_TEST_ALPHA_Q12, SELF_TEST_ITERATIONS).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.iter().sum::<i32>(), 1_276_910);
+        assert_eq!(first.len(), POUW_CELL_COUNT);
         assert!(first.iter().all(|value| (0..=262_143).contains(value)));
     }
 
@@ -678,15 +697,16 @@ mod tests {
     #[ignore = "requires a locally built native accelerator and compatible hardware"]
     fn installed_accelerator_verifies_non_self_test_work() {
         let registry = AcceleratorRegistry::discover(Path::new("accelerators"));
-        let input = vec![
-            1024, 2048, 8192, 32768, 65536, 131072, 196608, 262143, 196608, 131072, 65536, 32768,
-        ];
+        let input = self_test_input();
         let execution = registry
             .execute_verified(Some("nvidia-cuda"), &input, 384, 19)
             .unwrap();
         assert_eq!(execution.backend, "nvidia-cuda");
         assert_eq!(execution.output.len(), input.len());
-        assert_eq!(execution.operation_count, input.len() as u64 * 19 * 6);
+        assert_eq!(
+            execution.operation_count,
+            input.len() as u64 * 19 * OPERATIONS_PER_CELL
+        );
         assert_eq!(execution.input_commitment.len(), 64);
         assert_eq!(execution.output_commitment.len(), 64);
         assert_ne!(execution.input_commitment, execution.output_commitment);

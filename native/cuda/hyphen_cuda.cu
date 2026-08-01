@@ -26,19 +26,31 @@ template <size_t N> void copy_text(uint8_t (&destination)[N], const char *text) 
   }
 }
 
-__global__ void diffusion_step(const int32_t *input, int32_t *output,
-                               size_t count, uint32_t alpha_q12) {
+__global__ void diffusion_step_2d(const int32_t *input, int32_t *output,
+                                  size_t count, uint32_t alpha_q12) {
   const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= count) {
     return;
   }
-  const size_t left_index = index == 0 ? count - 1 : index - 1;
-  const size_t right_index = index + 1 == count ? 0 : index + 1;
+  const size_t row = index / HYPHEN_POUW_GRID_SIDE;
+  const size_t column = index % HYPHEN_POUW_GRID_SIDE;
+  const size_t north =
+      ((row + HYPHEN_POUW_GRID_SIDE - 1) % HYPHEN_POUW_GRID_SIDE) *
+          HYPHEN_POUW_GRID_SIDE +
+      column;
+  const size_t south = ((row + 1) % HYPHEN_POUW_GRID_SIDE) *
+                           HYPHEN_POUW_GRID_SIDE +
+                       column;
+  const size_t west = row * HYPHEN_POUW_GRID_SIDE +
+                      (column + HYPHEN_POUW_GRID_SIDE - 1) %
+                          HYPHEN_POUW_GRID_SIDE;
+  const size_t east = row * HYPHEN_POUW_GRID_SIDE +
+                      (column + 1) % HYPHEN_POUW_GRID_SIDE;
   const int64_t alpha = static_cast<int64_t>(alpha_q12);
-  const int64_t center_weight = INT64_C(4096) - INT64_C(2) * alpha;
-  const int64_t numerator =
-      center_weight * input[index] + alpha * input[left_index] +
-      alpha * input[right_index];
+  const int64_t center_weight = INT64_C(4096) - INT64_C(4) * alpha;
+  const int64_t neighbours = static_cast<int64_t>(input[north]) + input[south] +
+                             input[west] + input[east];
+  const int64_t numerator = center_weight * input[index] + alpha * neighbours;
   output[index] = static_cast<int32_t>(numerator / INT64_C(4096));
 }
 
@@ -92,7 +104,7 @@ int32_t enumerate_devices(HyphenDeviceInfoV1 *devices, uint32_t capacity,
     device.device_ordinal = static_cast<uint32_t>(ordinal);
     device.device_kind = HYPHEN_DEVICE_KIND_GPU;
     device.hardware_accelerated = 1;
-    device.capability_mask = HYPHEN_CAP_DIFFUSION_Q12_V1;
+    device.capability_mask = HYPHEN_CAP_DIFFUSION_2D_Q12_V1;
     copy_text(device.backend, "nvidia-cuda");
     copy_text(device.vendor, "NVIDIA");
     copy_text(device.name, properties.name);
@@ -114,7 +126,7 @@ int32_t execute(const HyphenExecuteRequestV1 *request,
   result->output_len = 0;
   result->operation_count = 0;
   result->device_time_ns = 0;
-  if (request->kernel_id != HYPHEN_KERNEL_DIFFUSION_Q12_V1) {
+  if (request->kernel_id != HYPHEN_KERNEL_DIFFUSION_2D_Q12_V1) {
     set_error("unsupported kernel ID");
     return 11;
   }
@@ -123,12 +135,12 @@ int32_t execute(const HyphenExecuteRequestV1 *request,
     return 12;
   }
   const size_t count = request->input_len / sizeof(int32_t);
-  if (count < 3 || count > static_cast<size_t>(UINT32_MAX)) {
-    set_error("input cell count must be in 3..=UINT32_MAX");
+  if (count != HYPHEN_POUW_CELL_COUNT) {
+    set_error("input must contain exactly one 64x64 i32 grid");
     return 13;
   }
-  if (request->iterations == 0 || request->iterations > 1024 ||
-      request->alpha_q12 > 2048) {
+  if (request->iterations == 0 || request->iterations > 4096 ||
+      request->alpha_q12 > 1024) {
     set_error("iterations or alpha_q12 is outside the consensus profile");
     return 14;
   }
@@ -139,7 +151,7 @@ int32_t execute(const HyphenExecuteRequestV1 *request,
       return 15;
     }
   }
-  if (count > std::numeric_limits<uint64_t>::max() / request->iterations / 6) {
+  if (count > std::numeric_limits<uint64_t>::max() / request->iterations / 7) {
     set_error("operation count overflow");
     return 16;
   }
@@ -180,8 +192,8 @@ int32_t execute(const HyphenExecuteRequestV1 *request,
     const uint32_t grid_size =
         static_cast<uint32_t>((count + block_size - 1) / block_size);
     for (uint32_t iteration = 0; iteration < request->iterations; ++iteration) {
-      diffusion_step<<<grid_size, block_size>>>(current, next, count,
-                                                 request->alpha_q12);
+      diffusion_step_2d<<<grid_size, block_size>>>(current, next, count,
+                                                    request->alpha_q12);
       CUDA_CHECK(cudaGetLastError());
       int32_t *temporary = current;
       current = next;
@@ -204,7 +216,7 @@ int32_t execute(const HyphenExecuteRequestV1 *request,
     result->output = host_output;
     result->output_len = bytes;
     result->operation_count =
-        static_cast<uint64_t>(count) * request->iterations * UINT64_C(6);
+        static_cast<uint64_t>(count) * request->iterations * UINT64_C(7);
     result->device_time_ns = static_cast<uint64_t>(elapsed_ms * 1000000.0F);
     host_output = nullptr;
     status = 0;

@@ -27,7 +27,11 @@ use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
 use accelerator::{AcceleratorRegistry, BackendStatus};
-use pow::{difficulty_to_target, evaluate_pow_with_epoch, EpochArena, EpochKernelParams};
+use pow::{
+    difficulty_to_iterations, evaluate_pow_with_epoch, evaluate_scientific_work_at,
+    operation_count, scientific_input_cells, scientific_output_commitment, EpochArena,
+    EpochKernelParams, POUW_ALPHA_Q12,
+};
 use primitives::{
     BlockAuthorization, BlockHeader, ChainConfig, Hash256, SecretKey, FROZEN_BLOCK_VERSION,
 };
@@ -104,10 +108,10 @@ enum Commands {
         /// Destination for the verified little-endian i32 result.
         #[arg(long)]
         output: PathBuf,
-        /// Q12 diffusion coefficient in 0..=2048.
+        /// Q12 diffusion coefficient in 0..=1024.
         #[arg(long, default_value_t = 512)]
         alpha_q12: u32,
-        /// Number of deterministic evolution steps in 1..=1024.
+        /// Number of deterministic evolution steps in 1..=4096.
         #[arg(long, default_value_t = 1)]
         iterations: u32,
         /// Restrict execution to a backend such as nvidia-cuda or intel-openvino.
@@ -133,8 +137,8 @@ struct MinerState {
     job_generation: AtomicU64,
     current_share_difficulty: AtomicU64,
     difficulty_generation: AtomicU64,
-    estimated_hashrate: AtomicU64,
-    total_hashes: AtomicU64,
+    estimated_compute_rate: AtomicU64,
+    total_operations: AtomicU64,
     shares_accepted: AtomicU64,
     shares_rejected: AtomicU64,
     blocks_found: AtomicU64,
@@ -154,8 +158,8 @@ impl MinerState {
             job_generation: AtomicU64::new(0),
             current_share_difficulty: AtomicU64::new(100),
             difficulty_generation: AtomicU64::new(0),
-            estimated_hashrate: AtomicU64::new(0),
-            total_hashes: AtomicU64::new(0),
+            estimated_compute_rate: AtomicU64::new(0),
+            total_operations: AtomicU64::new(0),
             shares_accepted: AtomicU64::new(0),
             shares_rejected: AtomicU64::new(0),
             blocks_found: AtomicU64::new(0),
@@ -341,6 +345,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli.batch_size,
             &wallet_pubkey,
             cli.allow_shared_reward_recipient,
+            &cli.accelerator_dir,
+            cli.require_accelerator,
         )
         .await
         {
@@ -457,6 +463,8 @@ async fn connect_and_mine(
     cli_batch_size: u64,
     wallet_pubkey: &[u8],
     allow_shared_reward_recipient: bool,
+    accelerator_dir: &std::path::Path,
+    require_accelerator: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Bump connection generation so stale mining threads from a previous
     // connection will see the change and exit.
@@ -482,8 +490,8 @@ async fn connect_and_mine(
 
     info!("Connected to pool at {pool_addr}");
 
-    let estimated_hashrate = state
-        .estimated_hashrate
+    let estimated_operations_per_second = state
+        .estimated_compute_rate
         .load(Ordering::Acquire)
         .max((threads as u64).saturating_mul(128));
 
@@ -491,7 +499,7 @@ async fn connect_and_mine(
         miner_id: hex::encode(sk.public_key().as_bytes()),
         user_agent: user_agent.to_string(),
         payout_pubkey: wallet_pubkey.to_vec(),
-        estimated_hashrate,
+        estimated_operations_per_second,
         thread_count: threads as u32,
         network_magic: cfg.network_magic.to_vec(),
         protocol_version: POOL_PROTOCOL_VERSION,
@@ -560,32 +568,36 @@ async fn connect_and_mine(
     let state_clone = Arc::clone(state);
     let submit_tx = start_mining_threads(
         threads,
-        cfg_clone.clone(),
         state_clone,
-        cli_batch_size,
-        conn_gen,
-        sk.clone(),
+        MiningLaunchConfig {
+            chain: cfg_clone.clone(),
+            batch_size: cli_batch_size,
+            connection_generation: conn_gen,
+            miner_secret: sk.clone(),
+            accelerator_dir: accelerator_dir.to_path_buf(),
+            require_accelerator,
+        },
     );
 
-    let hashrate_state = Arc::clone(state);
-    let hashrate_handle = tokio::spawn(async move {
+    let compute_rate_state = Arc::clone(state);
+    let compute_rate_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        let mut last_hashes: u64 = 0;
+        let mut last_operations: u64 = 0;
         loop {
             interval.tick().await;
-            let current = hashrate_state.total_hashes.load(Ordering::Relaxed);
-            let delta = current.saturating_sub(last_hashes);
-            last_hashes = current;
+            let current = compute_rate_state.total_operations.load(Ordering::Relaxed);
+            let delta = current.saturating_sub(last_operations);
+            last_operations = current;
             let rate = delta as f64 / 10.0;
-            hashrate_state
-                .estimated_hashrate
+            compute_rate_state
+                .estimated_compute_rate
                 .store(rate.round() as u64, Ordering::Release);
             info!(
-                "Hashrate: {:.2} H/s | Shares: {} accepted, {} rejected | Blocks: {}",
+                "Scientific compute: {:.2} ops/s | Checkpoints: {} accepted, {} rejected | Blocks: {}",
                 rate,
-                hashrate_state.shares_accepted.load(Ordering::Relaxed),
-                hashrate_state.shares_rejected.load(Ordering::Relaxed),
-                hashrate_state.blocks_found.load(Ordering::Relaxed),
+                compute_rate_state.shares_accepted.load(Ordering::Relaxed),
+                compute_rate_state.shares_rejected.load(Ordering::Relaxed),
+                compute_rate_state.blocks_found.load(Ordering::Relaxed),
             );
         }
     });
@@ -618,24 +630,25 @@ async fn connect_and_mine(
     let report_sk = sk.clone();
     let report_state = Arc::clone(state);
     let start_time = std::time::Instant::now();
-    let hashrate_report_handle = tokio::spawn(async move {
+    let compute_rate_report_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        let mut last_hashes: u64 = 0;
+        let mut last_operations: u64 = 0;
         loop {
             interval.tick().await;
-            let current = report_state.total_hashes.load(Ordering::Relaxed);
-            let delta = current.saturating_sub(last_hashes);
-            last_hashes = current;
+            let current = report_state.total_operations.load(Ordering::Relaxed);
+            let delta = current.saturating_sub(last_operations);
+            last_operations = current;
             let rate = delta / 5;
             report_state
-                .estimated_hashrate
+                .estimated_compute_rate
                 .store(rate, Ordering::Release);
-            let report = HashrateReport {
-                hashrate: rate,
-                total_hashes: current,
+            let report = ComputeRateReport {
+                operations_per_second: rate,
+                total_operations: current,
                 uptime_secs: start_time.elapsed().as_secs(),
             };
-            let env = PoolEnvelope::sign(MSG_HASHRATE_REPORT, report.encode_to_vec(), &report_sk);
+            let env =
+                PoolEnvelope::sign(MSG_COMPUTE_RATE_REPORT, report.encode_to_vec(), &report_sk);
             let data = env.encode_to_vec();
             let mut w = report_writer.lock().await;
             use tokio::io::AsyncWriteExt;
@@ -735,12 +748,12 @@ async fn connect_and_mine(
                 }
 
                 share = share_rx.recv() => {
-                    if let Some((nonce, extra_nonce, pow_hash, job_id, block_authorization)) = share {
+                    if let Some((nonce, extra_nonce, work_commitment, job_id, block_authorization)) = share {
                         let submission = ShareSubmission {
                             job_id: job_id.to_vec(),
                             nonce,
                             extra_nonce: extra_nonce.to_vec(),
-                            pow_hash: pow_hash.as_bytes().to_vec(),
+                            work_commitment: work_commitment.as_bytes().to_vec(),
                             block_authorization,
                         };
                         let submission_payload = submission.encode_to_vec();
@@ -770,9 +783,9 @@ async fn connect_and_mine(
     .await;
 
     // Abort background tasks so they don't leak on reconnect
-    hashrate_handle.abort();
+    compute_rate_handle.abort();
     keepalive_handle.abort();
-    hashrate_report_handle.abort();
+    compute_rate_report_handle.abort();
 
     loop_result
 }
@@ -909,23 +922,32 @@ struct MiningThreadConfig {
     batch_size: u64,
     connection_generation: u64,
     miner_secret: SecretKey,
+    accelerator_dir: PathBuf,
+    require_accelerator: bool,
+}
+
+struct MiningLaunchConfig {
+    chain: ChainConfig,
+    batch_size: u64,
+    connection_generation: u64,
+    miner_secret: SecretKey,
+    accelerator_dir: PathBuf,
+    require_accelerator: bool,
 }
 
 fn start_mining_threads(
     threads: usize,
-    cfg: ChainConfig,
     state: Arc<MinerState>,
-    batch_size: u64,
-    conn_gen: u64,
-    miner_secret: SecretKey,
+    launch: MiningLaunchConfig,
 ) -> tokio::sync::mpsc::UnboundedReceiver<ShareResult> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     for thread_id in 0..threads {
-        let cfg = cfg.clone();
+        let cfg = launch.chain.clone();
         let state = Arc::clone(&state);
         let tx = tx.clone();
-        let miner_secret = miner_secret.clone();
+        let miner_secret = launch.miner_secret.clone();
+        let accelerator_dir = launch.accelerator_dir.clone();
 
         std::thread::spawn(move || {
             mining_thread(
@@ -933,9 +955,11 @@ fn start_mining_threads(
                     thread_id,
                     thread_count: threads,
                     chain: cfg,
-                    batch_size,
-                    connection_generation: conn_gen,
+                    batch_size: launch.batch_size,
+                    connection_generation: launch.connection_generation,
                     miner_secret,
+                    accelerator_dir,
+                    require_accelerator: launch.require_accelerator,
                 },
                 state,
                 tx,
@@ -958,8 +982,20 @@ fn mining_thread(
         batch_size,
         connection_generation: conn_gen,
         miner_secret,
+        accelerator_dir,
+        require_accelerator,
     } = config;
     info!("Mining thread {thread_id}/{thread_count} started (batch_size={batch_size})");
+
+    let accelerators = AcceleratorRegistry::discover(&accelerator_dir);
+    if require_accelerator && accelerators.available_devices() == 0 {
+        error!(
+            "mining thread {thread_id} cannot load a verified accelerator from {}",
+            accelerator_dir.display()
+        );
+        state.running.store(false, Ordering::Release);
+        return;
+    }
 
     #[allow(unused_assignments)]
     let mut last_gen: u64 = 0;
@@ -987,10 +1023,10 @@ fn mining_thread(
         last_gen = current_gen;
 
         let arena = state.get_arena(job.epoch_seed, job.arena_size, job.page_size);
-
-        let share_diff = state.current_share_difficulty.load(Ordering::Acquire);
-        let share_target = difficulty_to_target(share_diff);
-        let block_target = difficulty_to_target(job.header.difficulty);
+        let share_iterations = state
+            .current_share_difficulty
+            .load(Ordering::Acquire)
+            .clamp(1, job.header.difficulty);
 
         // Pre-compute epoch kernel params once per job (same epoch → same params)
         let epoch = EpochKernelParams::derive(arena.params.epoch_seed.as_bytes());
@@ -1015,42 +1051,113 @@ fn mining_thread(
             let nonce = base_nonce.wrapping_add(i * thread_count as u64);
             candidate.nonce = nonce;
 
-            let hash = evaluate_pow_with_epoch(&candidate, &arena, &cfg, &epoch);
-            state.total_hashes.fetch_add(1, Ordering::Relaxed);
-
-            if hash_below_target(&hash, &share_target) {
-                info!(
-                    "Thread {thread_id}: share found nonce={nonce} hash={}",
-                    hash
-                );
-                let block_authorization = if hash_below_target(&hash, &block_target) {
-                    match BlockAuthorization::sign(
-                        &candidate,
-                        &cfg,
-                        job.reward_view_public,
-                        job.reward_spend_public,
-                        &miner_secret,
-                    )
-                    .and_then(|authorization| {
-                        wire_config(256)
-                            .serialize(&authorization)
-                            .map_err(|error| error.to_string())
-                    }) {
-                        Ok(encoded) => encoded,
-                        Err(error) => {
-                            error!("refusing unsigned block solution: {error}");
-                            continue;
-                        }
+            candidate.pow_commitment = Hash256::ZERO;
+            let mut performed_operations = 0u64;
+            if share_iterations < job.header.difficulty {
+                let checkpoint = match u32::try_from(share_iterations)
+                    .ok()
+                    .and_then(|iterations| evaluate_scientific_work_at(&candidate, iterations))
+                {
+                    Some(commitment) => commitment,
+                    None => {
+                        error!("job specifies an invalid scientific checkpoint");
+                        break;
                     }
-                } else {
-                    Vec::new()
                 };
-                let _ = tx.send((nonce, extra_nonce, hash, job.job_id, block_authorization));
+                let _ = tx.send((nonce, extra_nonce, checkpoint, job.job_id, Vec::new()));
+                performed_operations = performed_operations
+                    .saturating_add(operation_count(share_iterations).unwrap_or(0));
             }
+            let work_commitment = match evaluate_candidate_work(
+                &candidate,
+                &arena,
+                &cfg,
+                &epoch,
+                &accelerators,
+                require_accelerator,
+            ) {
+                Ok(commitment) => commitment,
+                Err(error) => {
+                    error!("scientific accelerator execution failed: {error}");
+                    state.running.store(false, Ordering::Release);
+                    break;
+                }
+            };
+            if work_commitment == Hash256::ZERO {
+                error!("job specifies an invalid scientific PoUW iteration count");
+                break;
+            }
+            candidate.pow_commitment = work_commitment;
+            performed_operations = performed_operations
+                .saturating_add(operation_count(job.header.difficulty).unwrap_or(0));
+            state
+                .total_operations
+                .fetch_add(performed_operations, Ordering::Relaxed);
+
+            info!(
+                "Thread {thread_id}: scientific work completed nonce={nonce} commitment={}",
+                work_commitment
+            );
+            let block_authorization = match BlockAuthorization::sign(
+                &candidate,
+                &cfg,
+                job.reward_view_public,
+                job.reward_spend_public,
+                &miner_secret,
+            )
+            .and_then(|authorization| {
+                wire_config(256)
+                    .serialize(&authorization)
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    error!("refusing unsigned scientific-work result: {error}");
+                    continue;
+                }
+            };
+            let _ = tx.send((
+                nonce,
+                extra_nonce,
+                work_commitment,
+                job.job_id,
+                block_authorization,
+            ));
+            break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
     info!("Mining thread {thread_id} stopped");
+}
+
+fn evaluate_candidate_work(
+    candidate: &BlockHeader,
+    arena: &EpochArena,
+    cfg: &ChainConfig,
+    epoch: &EpochKernelParams,
+    accelerators: &AcceleratorRegistry,
+    require_accelerator: bool,
+) -> Result<Hash256, String> {
+    if accelerators.available_devices() == 0 {
+        if require_accelerator {
+            return Err("no accelerator passed the consensus-kernel self-test".into());
+        }
+        return Ok(evaluate_pow_with_epoch(candidate, arena, cfg, epoch));
+    }
+
+    let iterations = difficulty_to_iterations(candidate.difficulty)
+        .ok_or("job specifies an invalid scientific PoUW iteration count")?;
+    let input = scientific_input_cells(candidate);
+    match accelerators.execute_verified(None, &input, POUW_ALPHA_Q12 as u32, iterations) {
+        Ok(execution) => scientific_output_commitment(candidate, iterations, &execution.output)
+            .ok_or_else(|| "accelerator output does not match the consensus profile".into()),
+        Err(error) if require_accelerator => Err(error),
+        Err(error) => {
+            warn!("accelerator rejected work; using Rust CPU consensus kernel: {error}");
+            Ok(evaluate_pow_with_epoch(candidate, arena, cfg, epoch))
+        }
+    }
 }
 
 fn compute_tx_root(transactions: &[Vec<u8>]) -> Hash256 {
@@ -1073,17 +1180,6 @@ fn compute_tx_root(transactions: &[Vec<u8>]) -> Hash256 {
         level = next;
     }
     level[0]
-}
-
-fn hash_below_target(hash: &Hash256, target: &[u8; 32]) -> bool {
-    for (h, t) in hash.as_bytes().iter().zip(target.iter()) {
-        match h.cmp(t) {
-            std::cmp::Ordering::Less => return true,
-            std::cmp::Ordering::Greater => return false,
-            std::cmp::Ordering::Equal => continue,
-        }
-    }
-    true
 }
 
 fn verify_share_receipt(

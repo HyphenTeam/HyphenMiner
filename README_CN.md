@@ -1,29 +1,53 @@
-# Hyphen Miner (Chinese Compatibility Entry)
-
-This compatibility entry preserves the Chinese documentation URL. The complete
-English-first, Chinese-second README is available in [README.md](README.md).
-
----
-
-<!-- hyphen-bilingual-chinese -->
-
 # Hyphen Miner
 
 [English](README.md)
 
-Hyphen Miner 是独立矿工和原生科学加速器宿主。它连接 Hyphen Pool Protocol v3、验证 PoW 工作模板，并通过版本化 C ABI 加载 CUDA、HIP、OpenVINO 和 QNN 插件，厂商 SDK 不进入面向共识的 Rust 进程。
+Hyphen Miner 是 Hyphen 区块版本 3 的独立科学计算矿工。它使用 Pool Protocol v5，并拒绝旧协议、旧链身份和旧区块版本。
 
-## 当前真实能力
+## 科学计算 PoUW
 
-已经实现多线程挖矿、epoch arena 共享、断线退避重连、VarDiff、签名消息、奖励地址约束、交易根复算、完整区块授权和签名 share 回执链。原生加速器 ABI 已实现有界、确定性的 Q12 扩散/PDE 算子；每次设备输出返回前都会由独立 Rust 实现完整复算。
+矿工、Pool 和节点执行相同的 64x64 Q12 二维扩散 PDE。区块难度是完整工作的精确迭代数；Pool 请求的较低迭代数只是贡献计量检查点，不是低哈希 share。
 
-NVIDIA CUDA 已在当前开发机实机验证。AMD HIP 与 Intel OpenVINO NPU/GPU 是条件构建后端；缺 SDK 或硬件时明确显示 `unavailable`。QNN 插件会真实初始化 HTP provider/device，但在目标 SoC 的确定性 graph package 未安装前不公布计算能力，不能进入调度。
+每个任务按以下顺序处理：
 
-Pool v3 仍未实现科研任务分发，矿工也尚未提交 `hyphen-compute` 结果 envelope；生产科研 circuit/verifier key 仍不存在。因此本地设备正确执行不是 SNARK，也不是已完成的链上 PoUW 结算。
+1. 校验 network magic、共识参数哈希、创世哈希、区块版本、高度、父块、epoch seed、奖励公钥、交易字节和交易根。
+2. 从除 `pow_commitment` 外的完整区块头派生科学计算输入。
+3. 按 Pool v5 要求提交较低迭代数的科学计算检查点。
+4. 完成区块要求的全部迭代，承诺最终场，并签署完整区块头和奖励公钥。
+5. 对每个接收结果校验 Pool 的签名回执链。
 
-因此当前准确结论是：矿工能检测池在发出 job 以后替换交易列表、奖励地址或 header，但 Pool v3 的交易集合仍由池选择，不能声称已经消灭交易审查和 MEV。
+BLAKE3 只用于确定性输入派生、承诺、消息摘要和回执完整性。矿工不会把摘要与难度目标比较。
 
-## 构建和运行
+当前 PoUW v1 内核尚未绑定用户发布的 AetherCompute 科研任务，只能证明指定 PDE 已执行；它不能证明外部科学价值，也不提供简洁验证。遥测按每个单元每轮 7 次规范算术操作计数，不代表原生指令数或能耗。
+
+固定跨实现向量：
+
+```text
+25078c250c5b44211bbf0fea60e90ac7024df6ff94d154161852fdd72684e524
+```
+
+## 原生加速器
+
+原生 ABI v2 定义与共识一致的 64x64、四邻域、周期边界 Q12 内核。CUDA、HIP 和 OpenVINO 插件不把厂商 SDK 链接进 Rust 协议进程。设备结果只有通过独立 Rust 实现逐字节复核后才会用于挖矿；旧 ABI v1 插件会被拒绝。QNN 在目标设备图包实现 ABI v2 前保持 fail-closed。
+
+没有通过自检的设备时默认使用 Rust CPU 内核。指定 `--require-accelerator` 后禁止回退：主线程和工作线程都必须成功加载插件，设备执行失败会停止挖矿，不会提交未经检查的结果。
+
+构建已安装 SDK 的后端，例如 CUDA：
+
+```powershell
+cmake -S .\native -B .\native\build -DHYPHEN_ENABLE_CUDA=ON
+cmake --build .\native\build --config Release
+```
+
+检查设备：
+
+```powershell
+.\target\release\hyphen-miner.exe --accelerator-dir .\accelerators accelerators
+```
+
+这项设备复核不是 SNARK/STARK，也不是用户 AetherCompute 任务的结算证明。缺少 SDK 或硬件时，后端只会报告 unavailable。
+
+## 构建与运行
 
 ```powershell
 cargo build --release --locked
@@ -32,104 +56,33 @@ cargo clippy --all-targets --locked -- -D warnings
 .\target\release\hyphen-miner.exe keygen --output .\miner.key
 ```
 
+连接 Pool：
+
 ```powershell
 .\target\release\hyphen-miner.exe `
-  --network devnet `
   --pool 127.0.0.1:3340 `
+  --network devnet `
   --key-file .\miner.key `
-  --wallet-address '<与网络匹配的 hy1 地址>' `
-  --threads 0 `
-  --batch-size 100000
+  --wallet-address '<devnet-hy1-address>' `
+  --threads 4 `
+  --accelerator-dir .\accelerators
 ```
 
-`--threads 0` 使用全部逻辑 CPU。mainnet 研究配置拒绝临时身份。只有在你明确接受共享池把 coinbase 指向结算钱包时，才使用 `--allow-shared-reward-recipient`。
+以当前二进制的 `--help` 为参数权威来源。`miner.key` 是矿工协议身份密钥，不是钱包恢复密钥。
 
-## 原生科学加速器
+## 兼容性与安全边界
 
-只构建本机已经安装 SDK 的后端，插件输出到 `accelerators/`：
+- Pool protocol：5
+- Accelerator ABI：2
+- Block version：3
+- PoUW protocol：1
+- Devnet 共识参数：`54bf97e4e28d4fcf963d884a555a8425bbfe7c84d2753001bcabbaf116232fda`
+- Devnet genesis：`47d530160cfef9141fe3b37b886e09b9f96ec4dc93d6c05005b9c6dbf35b1972`
 
-```powershell
-cmake -S native -B native/build-cuda -G Ninja `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DHYPHEN_ENABLE_CUDA=ON
-cmake --build native/build-cuda --config Release
+RustBinary 使用有界字节数、有界集合长度、固定宽度小端编码，并拒绝尾随字节。共识迁移必须显式失败；承诺、签名和授权路径禁止格式回退。
 
-cmake -S native -B native/build-openvino -G Ninja `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DHYPHEN_ENABLE_OPENVINO=ON `
-  -DOpenVINO_DIR='<openvino-runtime>/cmake'
-
-cmake -S native -B native/build-hip -G Ninja `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DHYPHEN_ENABLE_HIP=ON
-
-cmake -S native -B native/build-qnn -G Ninja `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DHYPHEN_ENABLE_QNN=ON `
-  -DQNN_SDK_ROOT='D:/Qualcomm AI Engine Direct SDK'
-```
-
-枚举设备并执行设备端/CPU 已知答案交叉验证：
-
-```powershell
-.\target\release\hyphen-miner.exe `
-  --accelerator-dir .\accelerators `
-  accelerators
-```
-
-`available`、`unavailable`、`self-test failed` 是三个不同状态。加入 `--require-accelerator` 后，没有设备通过真实设备执行、逐字节复算和操作数检查时，Miner 会拒绝启动。
-
-执行并完整复核科研算子。输入和输出均为小端 `i32` 数组，v1 至少需要三个 `0..=262143` 的单元：
-
-```powershell
-.\target\release\hyphen-miner.exe `
-  --accelerator-dir .\accelerators `
-  scientific-run `
-  --backend nvidia-cuda `
-  --input .\cells.i32le `
-  --output .\evolved.i32le `
-  --alpha-q12 512 `
-  --iterations 64
-```
-
-只有完整输出与 Rust 一致后，命令才打印域分离的输入/输出 commitment、稳定设备 ID、操作数和设备耗时。这是确定性执行验证，不是 ZK/SNARK 证明。
-
-## 模板验证
-
-矿工开始计算前会检查协议版本、network magic、共识参数哈希、genesis hash、区块版本、高度、难度、epoch seed、矿工公钥、奖励公钥、arena 上限、交易字节和交易根。任一字段不一致都会拒绝 job。找到完整区块后，矿工签署的授权把 header 与奖励公钥绑定，池不能拿同一个解去替换交易根或收款人。
-
-## PoW 与回执链的数学含义
-
-将 256-bit PoW 输出看成在 `[0,2^256-1]` 上均匀分布的整数 `X`。难度 `D>=1` 对应：
-
-```text
-T(D)=floor((2^256-1)/D),    接受条件 X<=T(D).
-```
-
-单次成功概率为：
-
-```text
-p_D=(T(D)+1)/2^256 ~= 1/D.
-```
-
-独立尝试 `n` 次至少成功一次的概率为 `1-(1-p_D)^n`；哈希率为 `h` 时，期望等待时间为 `1/(h p_D)`，近似 `D/h`。这是期望，不是某段时间内必然找到。
-
-Share 使用较低的 `D_share`，区块使用 `D_block`。满足区块难度的结果一定满足正常配置下的 share 难度，但普通 share 不是区块、不是链上余额，只是结算贡献证据。
-
-第 `i` 个接受回执为：
-
-```text
-r_i=H_d(pool_pk,miner_pk,i,r_(i-1),H(submission_i),H(result_i)).
-```
-
-池对含 `r_i` 的 envelope 签名。若修改旧 submission、result、序号或前驱，后续回执都会改变；想保持链头不变需要哈希碰撞或签名伪造。这个性质是防篡改证据，不是公开账本可用性，也不能证明矿池有钱付款。
-
-## CI 和 Release
-
-CI 执行格式、严格 Clippy、测试和锁定依赖的 release build。只有 `main` 上 CI 成功才触发自动 Release，分别构建 Linux、Windows、macOS 可执行文件，附提交号、工具链、调试信息和 SHA-256，并发布为 commit-bound prerelease。
-
-`miner.key` 只能用于矿工协议身份，不能恢复钱包，也绝不能上传。
+本软件尚未经过独立共识、密码学或加速器审计，只应在研究网络使用。
 
 ## 许可证
 
-HyphenMiner 使用 PolyForm Strict License 1.0.0，完整条款见 [LICENSE](LICENSE)。
+Hyphen Miner 使用 PolyForm Strict License 1.0.0，完整条款见 [LICENSE](LICENSE)。

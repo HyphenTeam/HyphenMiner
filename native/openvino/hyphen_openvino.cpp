@@ -72,7 +72,7 @@ int32_t enumerate_devices(HyphenDeviceInfoV1 *output, uint32_t capacity,
                                ? HYPHEN_DEVICE_KIND_NPU
                                : HYPHEN_DEVICE_KIND_GPU;
       device.hardware_accelerated = 1;
-      device.capability_mask = HYPHEN_CAP_DIFFUSION_Q12_V1;
+      device.capability_mask = HYPHEN_CAP_DIFFUSION_2D_Q12_V1;
       copy_text(device.backend, "intel-openvino");
       copy_text(device.vendor, "Intel");
       copy_text(device.name, full_name);
@@ -90,33 +90,56 @@ std::shared_ptr<ov::Model> build_diffusion_model(size_t count,
                                                  uint32_t alpha_q12) {
   using namespace ov::opset13;
   auto input = std::make_shared<Parameter>(ov::element::i32, ov::Shape{count});
-  std::vector<int32_t> left_indices(count);
-  std::vector<int32_t> right_indices(count);
+  std::vector<int32_t> north_indices(count);
+  std::vector<int32_t> south_indices(count);
+  std::vector<int32_t> west_indices(count);
+  std::vector<int32_t> east_indices(count);
   for (size_t index = 0; index < count; ++index) {
-    left_indices[index] = static_cast<int32_t>(index == 0 ? count - 1 : index - 1);
-    right_indices[index] = static_cast<int32_t>(index + 1 == count ? 0 : index + 1);
+    const size_t row = index / HYPHEN_POUW_GRID_SIDE;
+    const size_t column = index % HYPHEN_POUW_GRID_SIDE;
+    north_indices[index] = static_cast<int32_t>(
+        ((row + HYPHEN_POUW_GRID_SIDE - 1) % HYPHEN_POUW_GRID_SIDE) *
+            HYPHEN_POUW_GRID_SIDE +
+        column);
+    south_indices[index] = static_cast<int32_t>(
+        ((row + 1) % HYPHEN_POUW_GRID_SIDE) * HYPHEN_POUW_GRID_SIDE + column);
+    west_indices[index] = static_cast<int32_t>(
+        row * HYPHEN_POUW_GRID_SIDE +
+        (column + HYPHEN_POUW_GRID_SIDE - 1) % HYPHEN_POUW_GRID_SIDE);
+    east_indices[index] = static_cast<int32_t>(
+        row * HYPHEN_POUW_GRID_SIDE + (column + 1) % HYPHEN_POUW_GRID_SIDE);
   }
   auto axis = Constant::create(ov::element::i32, ov::Shape{}, {0});
-  auto left_index =
-      Constant::create(ov::element::i32, ov::Shape{count}, left_indices);
-  auto right_index =
-      Constant::create(ov::element::i32, ov::Shape{count}, right_indices);
-  auto left = std::make_shared<Gather>(input, left_index, axis);
-  auto right = std::make_shared<Gather>(input, right_index, axis);
+  auto north_index =
+      Constant::create(ov::element::i32, ov::Shape{count}, north_indices);
+  auto south_index =
+      Constant::create(ov::element::i32, ov::Shape{count}, south_indices);
+  auto west_index =
+      Constant::create(ov::element::i32, ov::Shape{count}, west_indices);
+  auto east_index =
+      Constant::create(ov::element::i32, ov::Shape{count}, east_indices);
+  auto north = std::make_shared<Gather>(input, north_index, axis);
+  auto south = std::make_shared<Gather>(input, south_index, axis);
+  auto west = std::make_shared<Gather>(input, west_index, axis);
+  auto east = std::make_shared<Gather>(input, east_index, axis);
   auto alpha = Constant::create(ov::element::i32, ov::Shape{},
                                 {static_cast<int32_t>(alpha_q12)});
   auto center_weight = Constant::create(
-      ov::element::i32, ov::Shape{}, {4096 - static_cast<int32_t>(2 * alpha_q12)});
+      ov::element::i32, ov::Shape{}, {4096 - static_cast<int32_t>(4 * alpha_q12)});
   auto scale = Constant::create(ov::element::i32, ov::Shape{}, {4096});
   auto center_term = std::make_shared<Multiply>(input, center_weight);
-  auto left_term = std::make_shared<Multiply>(left, alpha);
-  auto right_term = std::make_shared<Multiply>(right, alpha);
-  auto sum = std::make_shared<Add>(std::make_shared<Add>(center_term, left_term),
-                                   right_term);
+  auto north_term = std::make_shared<Multiply>(north, alpha);
+  auto south_term = std::make_shared<Multiply>(south, alpha);
+  auto west_term = std::make_shared<Multiply>(west, alpha);
+  auto east_term = std::make_shared<Multiply>(east, alpha);
+  auto vertical = std::make_shared<Add>(north_term, south_term);
+  auto horizontal = std::make_shared<Add>(west_term, east_term);
+  auto neighbours = std::make_shared<Add>(vertical, horizontal);
+  auto sum = std::make_shared<Add>(center_term, neighbours);
   auto output = std::make_shared<Divide>(sum, scale);
   return std::make_shared<ov::Model>(ov::OutputVector{output},
                                      ov::ParameterVector{input},
-                                     "hyphen-diffusion-q12-v1");
+                                     "hyphen-diffusion-2d-q12-v1");
 }
 
 int32_t execute(const HyphenExecuteRequestV1 *request,
@@ -131,16 +154,15 @@ int32_t execute(const HyphenExecuteRequestV1 *request,
   result->output_len = 0;
   result->operation_count = 0;
   result->device_time_ns = 0;
-  if (request->kernel_id != HYPHEN_KERNEL_DIFFUSION_Q12_V1 ||
+  if (request->kernel_id != HYPHEN_KERNEL_DIFFUSION_2D_Q12_V1 ||
       request->input == nullptr || request->input_len % sizeof(int32_t) != 0) {
     set_error("unsupported kernel or malformed input");
     return 11;
   }
   const size_t count = request->input_len / sizeof(int32_t);
-  if (count < 3 || count > static_cast<size_t>(INT32_MAX) ||
-      request->iterations == 0 || request->iterations > 1024 ||
-      request->alpha_q12 > 2048) {
-    set_error("request is outside the diffusion-q12-v1 profile");
+  if (count != HYPHEN_POUW_CELL_COUNT || request->iterations == 0 ||
+      request->iterations > 4096 || request->alpha_q12 > 1024) {
+    set_error("request is outside the diffusion-2d-q12-v1 profile");
     return 12;
   }
   const auto *input = reinterpret_cast<const int32_t *>(request->input);
@@ -150,7 +172,7 @@ int32_t execute(const HyphenExecuteRequestV1 *request,
       return 13;
     }
   }
-  if (count > std::numeric_limits<uint64_t>::max() / request->iterations / 6) {
+  if (count > std::numeric_limits<uint64_t>::max() / request->iterations / 7) {
     set_error("operation count overflow");
     return 14;
   }
@@ -187,7 +209,7 @@ int32_t execute(const HyphenExecuteRequestV1 *request,
     result->output = output;
     result->output_len = request->input_len;
     result->operation_count =
-        static_cast<uint64_t>(count) * request->iterations * UINT64_C(6);
+        static_cast<uint64_t>(count) * request->iterations * UINT64_C(7);
     result->device_time_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
     return 0;
