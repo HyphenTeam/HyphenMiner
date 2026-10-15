@@ -1,22 +1,7 @@
-mod accelerator;
-mod pow;
 mod primitives;
 mod protocol;
 
-const DEFAULT_WIRE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_WIRE_COLLECTION_ITEMS: usize = 1_000_000;
-
-fn wire_config(max_bytes: usize) -> rustbinary::Config {
-    rustbinary::legacy_options()
-        .with_little_endian()
-        .with_fixint_encoding()
-        .with_limit(max_bytes as u64)
-        .with_collection_limit(max_bytes.min(MAX_WIRE_COLLECTION_ITEMS) as u64)
-        .reject_trailing_bytes()
-}
-
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -26,22 +11,11 @@ use prost::Message;
 use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
-use accelerator::{AcceleratorRegistry, BackendStatus};
-use pow::{
-    difficulty_to_iterations, evaluate_pow_with_epoch, evaluate_scientific_work_at,
-    operation_count, scientific_input_cells, scientific_output_commitment, EpochArena,
-    EpochKernelParams, POUW_ALPHA_Q12,
-};
 use primitives::{
-    BlockAuthorization, BlockHeader, ChainConfig, Hash256, SecretKey, FROZEN_BLOCK_VERSION,
+    hex_encode, wire_config, BlockAuthorization, BlockHeader, ChainConfig, ChainIdentity, Hash256,
+    SecretKey, FROZEN_BLOCK_VERSION,
 };
 use protocol::*;
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct ArenaParamsData {
-    pub arena_size: u64,
-    pub page_size: u64,
-}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -80,14 +54,6 @@ struct Cli {
     /// settlement wallet. The exact reward keys remain miner-authorized.
     #[arg(long, default_value_t = false)]
     allow_shared_reward_recipient: bool,
-
-    /// Directory containing hyphen_backend_* native accelerator plugins.
-    #[arg(long, default_value = "accelerators")]
-    accelerator_dir: PathBuf,
-
-    /// Refuse to start unless a device passes execution and independent CPU verification.
-    #[arg(long, default_value_t = false)]
-    require_accelerator: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -98,36 +64,13 @@ enum Commands {
         #[arg(long, default_value = "miner.key")]
         output: String,
     },
-    /// Enumerate plugins and run deterministic device/CPU cross-checks.
-    Accelerators,
-    /// Execute the deterministic diffusion PDE kernel and verify the complete device result.
-    ScientificRun {
-        /// Little-endian i32 input cells. Each cell must be in 0..=262143.
-        #[arg(long)]
-        input: PathBuf,
-        /// Destination for the verified little-endian i32 result.
-        #[arg(long)]
-        output: PathBuf,
-        /// Q12 diffusion coefficient in 0..=1024.
-        #[arg(long, default_value_t = 512)]
-        alpha_q12: u32,
-        /// Number of deterministic evolution steps in 1..=4096.
-        #[arg(long, default_value_t = 1)]
-        iterations: u32,
-        /// Restrict execution to a backend such as nvidia-cuda or intel-openvino.
-        #[arg(long, default_value = "")]
-        backend: String,
-    },
 }
 
 struct MiningJob {
     job_id: [u8; 32],
     header: BlockHeader,
-    #[allow(dead_code)]
-    share_difficulty: u64,
-    epoch_seed: Hash256,
-    arena_size: usize,
-    page_size: usize,
+    chain_length: u32,
+    parent_work_commitment: Hash256,
     reward_view_public: [u8; 32],
     reward_spend_public: [u8; 32],
 }
@@ -143,7 +86,10 @@ struct MinerState {
     shares_rejected: AtomicU64,
     blocks_found: AtomicU64,
     running: AtomicBool,
-    shared_arena: RwLock<Option<(Hash256, Arc<EpochArena>)>>,
+    /// Witnesses this miner has already handed to the pool. The pool enforces
+    /// single use chain-wide; locally we only avoid paying for our own
+    /// duplicates, which lets a worker keep scanning instead of restarting.
+    submitted_witnesses: RwLock<std::collections::HashSet<u64>>,
     /// Incremented on each new connection so stale mining threads exit.
     connection_generation: AtomicU64,
     receipt_sequence: AtomicU64,
@@ -164,7 +110,7 @@ impl MinerState {
             shares_rejected: AtomicU64::new(0),
             blocks_found: AtomicU64::new(0),
             running: AtomicBool::new(true),
-            shared_arena: RwLock::new(None),
+            submitted_witnesses: RwLock::new(std::collections::HashSet::new()),
             connection_generation: AtomicU64::new(0),
             receipt_sequence: AtomicU64::new(0),
             receipt_head: RwLock::new([0u8; 32]),
@@ -172,34 +118,15 @@ impl MinerState {
         }
     }
 
-    fn get_arena(
-        &self,
-        epoch_seed: Hash256,
-        arena_size: usize,
-        page_size: usize,
-    ) -> Arc<EpochArena> {
-        {
-            let guard = self.shared_arena.read();
-            if let Some((seed, ref a)) = *guard {
-                if seed == epoch_seed {
-                    return Arc::clone(a);
-                }
-            }
+    fn is_locally_claimed(&self, witness: u64) -> bool {
+        self.submitted_witnesses.read().contains(&witness)
+    }
+
+    fn mark_submitted(&self, witnesses: &[u64]) {
+        let mut claimed = self.submitted_witnesses.write();
+        for witness in witnesses {
+            claimed.insert(*witness);
         }
-        let mut guard = self.shared_arena.write();
-        if let Some((seed, ref a)) = *guard {
-            if seed == epoch_seed {
-                return Arc::clone(a);
-            }
-        }
-        info!(
-            "Generating epoch arena ({}MiB) for seed {}...",
-            arena_size / (1024 * 1024),
-            epoch_seed
-        );
-        let arena = Arc::new(EpochArena::generate(epoch_seed, arena_size, page_size));
-        *guard = Some((epoch_seed, Arc::clone(&arena)));
-        arena
     }
 }
 
@@ -220,56 +147,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Secret key file : {output}");
         println!("  Public key (hex): {}", sk.public_key());
         println!("\nKeep the secret key file safe. Never share it.");
-        return Ok(());
-    }
-
-    if matches!(cli.command, Some(Commands::Accelerators)) {
-        let registry = AcceleratorRegistry::discover(&cli.accelerator_dir);
-        print_accelerator_reports(&registry);
-        if cli.require_accelerator && registry.available_devices() == 0 {
-            return Err("no accelerator passed the deterministic device self-test".into());
-        }
-        return Ok(());
-    }
-
-    if let Some(Commands::ScientificRun {
-        input,
-        output,
-        alpha_q12,
-        iterations,
-        backend,
-    }) = &cli.command
-    {
-        let input_bytes = std::fs::read(input)?;
-        if !input_bytes.len().is_multiple_of(std::mem::size_of::<i32>()) {
-            return Err("scientific input length must be a multiple of four bytes".into());
-        }
-        let cells = input_bytes
-            .chunks_exact(std::mem::size_of::<i32>())
-            .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("exact chunk size")))
-            .collect::<Vec<_>>();
-        let registry = AcceleratorRegistry::discover(&cli.accelerator_dir);
-        let execution = registry.execute_verified(
-            (!backend.is_empty()).then_some(backend.as_str()),
-            &cells,
-            *alpha_q12,
-            *iterations,
-        )?;
-        let mut output_bytes =
-            Vec::with_capacity(std::mem::size_of_val(execution.output.as_slice()));
-        for value in &execution.output {
-            output_bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        std::fs::write(output, output_bytes)?;
-        println!("Verified scientific device execution:");
-        println!("  backend          : {}", execution.backend);
-        println!("  device           : {}", execution.device);
-        println!("  stable device ID : {}", execution.stable_id);
-        println!("  input commitment : {}", execution.input_commitment);
-        println!("  output commitment: {}", execution.output_commitment);
-        println!("  operation count  : {}", execution.operation_count);
-        println!("  device time (ns) : {}", execution.device_time_ns);
-        println!("  verified output  : {}", output.display());
         return Ok(());
     }
 
@@ -316,16 +193,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.pool, threads, cfg.network_name
     );
 
-    let accelerators = AcceleratorRegistry::discover(&cli.accelerator_dir);
-    log_accelerator_reports(&accelerators);
-    if cli.require_accelerator && accelerators.available_devices() == 0 {
-        return Err("no accelerator passed the deterministic device self-test".into());
-    }
-
     let state = Arc::new(MinerState::new());
 
     let wallet_pubkey = parse_wallet_address(&cli.wallet_address, &cfg)?;
-    info!("Payout wallet: {}", hex::encode(wallet_pubkey));
+    info!("Payout wallet: {}", hex_encode(wallet_pubkey));
 
     let mut backoff_secs = 5u64;
     loop {
@@ -345,8 +216,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli.batch_size,
             &wallet_pubkey,
             cli.allow_shared_reward_recipient,
-            &cli.accelerator_dir,
-            cli.require_accelerator,
         )
         .await
         {
@@ -367,67 +236,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn print_accelerator_reports(registry: &AcceleratorRegistry) {
-    println!(
-        "Native accelerator backends: {} loaded, {} verified devices",
-        registry.loaded_backend_count(),
-        registry.available_devices()
-    );
-    for report in registry.reports() {
-        let device = if report.name.is_empty() {
-            "-".to_string()
-        } else {
-            format!("{} ({})", report.name, report.stable_id)
-        };
-        let runtime = if report.runtime.is_empty() {
-            "-"
-        } else {
-            &report.runtime
-        };
-        println!(
-            "  {:<18} {:<24} runtime={:<16} {}",
-            report.backend, device, runtime, report.status
-        );
-        if let (Some(operations), Some(device_time_ns)) =
-            (report.operation_count, report.device_time_ns)
-        {
-            println!(
-                "    verified operations={operations}, device_time_ns={device_time_ns}, vendor={}",
-                report.vendor
-            );
-        }
-    }
-}
-
-fn log_accelerator_reports(registry: &AcceleratorRegistry) {
-    for report in registry.reports() {
-        match &report.status {
-            BackendStatus::Available => info!(
-                "accelerator verified: backend={}, device={}, stable_id={}, runtime={}, operations={}, device_time_ns={}",
-                report.backend,
-                report.name,
-                report.stable_id,
-                report.runtime,
-                report.operation_count.unwrap_or(0),
-                report.device_time_ns.unwrap_or(0)
-            ),
-            BackendStatus::Unavailable(reason) => {
-                info!("accelerator unavailable: backend={}, reason={reason}", report.backend)
-            }
-            BackendStatus::SelfTestFailed(reason) => warn!(
-                "accelerator self-test failed: backend={}, device={}, reason={reason}",
-                report.backend, report.name
-            ),
-        }
-    }
-}
-
 fn parse_wallet_address(address: &str, cfg: &ChainConfig) -> Result<[u8; 64], String> {
     let encoded = address.strip_prefix("hy1").ok_or_else(|| {
-        "pool protocol v3 requires --wallet-address with a hy1... address".to_string()
+        format!(
+            "pool protocol v{POOL_PROTOCOL_VERSION} requires --wallet-address with a hy1... address"
+        )
     })?;
-    let payload = bs58::decode(encoded)
-        .into_vec()
+    let payload = hyphen_crypto::base58::decode(encoded)
         .map_err(|_| "wallet address contains invalid base58".to_string())?;
     if payload.len() != 69 {
         return Err(format!(
@@ -443,7 +258,7 @@ fn parse_wallet_address(address: &str, cfg: &ChainConfig) -> Result<[u8; 64], St
     if payload[0] != expected_version {
         return Err("wallet address belongs to a different Hyphen network".into());
     }
-    let hash = blake3::hash(&payload[..65]);
+    let hash = hyphen_crypto::blake3_hash(&payload[..65]);
     if payload[65..69] != hash.as_bytes()[..4] {
         return Err("wallet address checksum mismatch".into());
     }
@@ -463,14 +278,14 @@ async fn connect_and_mine(
     cli_batch_size: u64,
     wallet_pubkey: &[u8],
     allow_shared_reward_recipient: bool,
-    accelerator_dir: &std::path::Path,
-    require_accelerator: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Bump connection generation so stale mining threads from a previous
     // connection will see the change and exit.
     state.connection_generation.fetch_add(1, Ordering::Release);
     *state.current_job.write() = None;
     state.job_generation.fetch_add(1, Ordering::Release);
+
+    let identity = ChainIdentity::of(cfg);
 
     let mut stream = TcpStream::connect(pool_addr).await?;
 
@@ -496,15 +311,15 @@ async fn connect_and_mine(
         .max((threads as u64).saturating_mul(128));
 
     let login = LoginRequest {
-        miner_id: hex::encode(sk.public_key().as_bytes()),
+        miner_id: hex_encode(sk.public_key().as_bytes()),
         user_agent: user_agent.to_string(),
         payout_pubkey: wallet_pubkey.to_vec(),
         estimated_operations_per_second,
         thread_count: threads as u32,
         network_magic: cfg.network_magic.to_vec(),
         protocol_version: POOL_PROTOCOL_VERSION,
-        consensus_params_hash: cfg.consensus_params_hash().to_vec(),
-        genesis_hash: cfg.genesis_hash().to_vec(),
+        consensus_params_hash: identity.consensus_params_hash.to_vec(),
+        genesis_hash: identity.genesis_hash.as_bytes().to_vec(),
     };
     let env = PoolEnvelope::sign(MSG_LOGIN, login.encode_to_vec(), sk);
     PoolCodec::write_envelope(&mut stream, &env).await?;
@@ -523,16 +338,16 @@ async fn connect_and_mine(
     if ack.protocol_version != POOL_PROTOCOL_VERSION
         || ack.network_magic.as_slice() != cfg.network_magic
         || ack.network_name != cfg.network_name
-        || ack.consensus_params_hash.as_slice() != cfg.consensus_params_hash()
-        || ack.genesis_hash.as_slice() != cfg.genesis_hash()
+        || ack.consensus_params_hash.as_slice() != identity.consensus_params_hash
+        || ack.genesis_hash.as_slice() != identity.genesis_hash.as_bytes()
     {
         return Err(format!(
             "pool network mismatch: expected {} ({}) v{}, got {} ({}) v{}",
             cfg.network_name,
-            hex::encode(cfg.network_magic),
+            hex_encode(cfg.network_magic),
             POOL_PROTOCOL_VERSION,
             ack.network_name,
-            hex::encode(&ack.network_magic),
+            hex_encode(&ack.network_magic),
             ack.protocol_version,
         )
         .into());
@@ -544,7 +359,7 @@ async fn connect_and_mine(
     );
     info!(
         "Synced with pool: tip_hash={}, block_time_target={}ms",
-        hex::encode(&ack.chain_tip_hash),
+        hex_encode(&ack.chain_tip_hash),
         ack.block_time_target_ms,
     );
 
@@ -574,8 +389,6 @@ async fn connect_and_mine(
             batch_size: cli_batch_size,
             connection_generation: conn_gen,
             miner_secret: sk.clone(),
-            accelerator_dir: accelerator_dir.to_path_buf(),
-            require_accelerator,
         },
     );
 
@@ -706,7 +519,7 @@ async fn connect_and_mine(
                                     state.blocks_found.fetch_add(1, Ordering::Relaxed);
                                     info!(
                                         "BLOCK FOUND! hash={}",
-                                        hex::encode(&result.block_hash)
+                                        hex_encode(&result.block_hash)
                                     );
                                 }
                             } else {
@@ -719,7 +532,7 @@ async fn connect_and_mine(
                             info!(
                                 "Block found at height {} by {}",
                                 notify.height,
-                                hex::encode(&notify.finder_pubkey)
+                                hex_encode(&notify.finder_pubkey)
                             );
                         }
                         MSG_SET_DIFFICULTY => {
@@ -740,7 +553,7 @@ async fn connect_and_mine(
                                 "Chain state update: height={}, block_diff={}, tip={}",
                                 chain_info.height,
                                 chain_info.difficulty,
-                                hex::encode(&chain_info.tip_hash),
+                                hex_encode(&chain_info.tip_hash),
                             );
                         }
                         _ => {}
@@ -748,16 +561,16 @@ async fn connect_and_mine(
                 }
 
                 share = share_rx.recv() => {
-                    if let Some((nonce, extra_nonce, work_commitment, job_id, block_authorization)) = share {
+                    if let Some(candidate) = share {
                         let submission = ShareSubmission {
-                            job_id: job_id.to_vec(),
-                            nonce,
-                            extra_nonce: extra_nonce.to_vec(),
-                            work_commitment: work_commitment.as_bytes().to_vec(),
-                            block_authorization,
+                            job_id: candidate.job_id.to_vec(),
+                            chain_length: candidate.chain_length as u64,
+                            witnesses: candidate.witnesses.clone(),
+                            work_commitment: candidate.work_commitment.as_bytes().to_vec(),
+                            block_authorization: candidate.block_authorization,
                         };
                         let submission_payload = submission.encode_to_vec();
-                        let submission_hash = *primitives::blake3_hash(&submission_payload).as_bytes();
+                        let submission_hash = *hyphen_crypto::blake3_hash(&submission_payload).as_bytes();
                         {
                             let mut pending = state.pending_submission_hashes.write();
                             if pending.len() >= 4_096 {
@@ -824,10 +637,41 @@ fn handle_new_job(
     if template.share_difficulty == 0 || template.block_difficulty == 0 {
         return Err("job difficulty must be greater than zero".into());
     }
-    if template.consensus_params_hash.as_slice() != cfg.consensus_params_hash()
-        || template.genesis_hash.as_slice() != cfg.genesis_hash()
+    if template.share_difficulty > template.block_difficulty {
+        return Err("share difficulty cannot exceed block difficulty".into());
+    }
+    if template.chain_length != cfg.pouw_chain_length as u64 {
+        return Err(format!(
+            "pool sent chain length {} but this network fixes {}/{} elements",
+            template.chain_length,
+            cfg.pouw_chain_length,
+            cfg.pouw_chain_length + 1,
+        )
+        .into());
+    }
+    if !(hyphen_pow::vms::MIN_CHAIN_LENGTH..=hyphen_pow::vms::MAX_CHAIN_LENGTH)
+        .contains(&cfg.pouw_chain_length)
+    {
+        return Err("network configuration has an unsupported chain length".into());
+    }
+    if template.block_difficulty > hyphen_pow::vms::MAX_WITNESSES_PER_BLOCK {
+        return Err("pool requested more witnesses than a block may claim".into());
+    }
+    if template.parent_work_commitment.len() != 32 {
+        return Err("job parent work commitment must be exactly 32 bytes".into());
+    }
+    let identity = ChainIdentity::of(cfg);
+    if template.consensus_params_hash.as_slice() != identity.consensus_params_hash
+        || template.genesis_hash.as_slice() != identity.genesis_hash.as_bytes()
     {
         return Err("pool sent a job for an incompatible chain identity".into());
+    }
+
+    if template.epoch_seed.len() != 32 {
+        return Err("epoch seed must be exactly 32 bytes".into());
+    }
+    if template.share_difficulty == 0 || template.block_difficulty == 0 {
+        return Err("job difficulty must be greater than zero".into());
     }
     if template.reward_view_public.len() != 32 || template.reward_spend_public.len() != 32 {
         return Err("job reward keys must both be exactly 32 bytes".into());
@@ -850,11 +694,17 @@ fn handle_new_job(
                 .into(),
         );
     }
+    if header.miner_pubkey != [0u8; 32] && header.miner_pubkey != miner_pubkey {
+        return Err("job header is already bound to a different miner identity".into());
+    }
+    let mut header = header;
+    header.miner_pubkey = miner_pubkey;
+
     if header.version != FROZEN_BLOCK_VERSION
         || header.height != template.height
         || header.difficulty != template.block_difficulty
         || header.epoch_seed.as_bytes() != template.epoch_seed.as_slice()
-        || header.miner_pubkey != miner_pubkey
+        || header.prev_hash.as_bytes() != template.prev_hash.as_slice()
     {
         return Err("job header metadata mismatch".into());
     }
@@ -865,29 +715,14 @@ fn handle_new_job(
     let mut job_id = [0u8; 32];
     job_id.copy_from_slice(&template.job_id);
 
-    let epoch_seed = Hash256::from_bytes(template.epoch_seed.clone().try_into().unwrap());
-
-    let (arena_size, page_size) = if template.arena_params.is_empty() {
-        (cfg.arena_size, cfg.page_size)
-    } else {
-        let params: ArenaParamsData = wire_config(64).deserialize(&template.arena_params)?;
-        if params.arena_size != cfg.arena_size as u64 || params.page_size != cfg.page_size as u64 {
-            return Err(format!(
-                "pool sent incompatible arena parameters: {}/{} (expected {}/{})",
-                params.arena_size, params.page_size, cfg.arena_size, cfg.page_size,
-            )
-            .into());
-        }
-        (params.arena_size as usize, params.page_size as usize)
-    };
+    let mut parent_work_commitment = [0u8; 32];
+    parent_work_commitment.copy_from_slice(&template.parent_work_commitment);
 
     let job = Arc::new(MiningJob {
         job_id,
         header,
-        share_difficulty: template.share_difficulty,
-        epoch_seed,
-        arena_size,
-        page_size,
+        chain_length: cfg.pouw_chain_length,
+        parent_work_commitment: Hash256::from_bytes(parent_work_commitment),
         reward_view_public,
         reward_spend_public,
     });
@@ -899,9 +734,10 @@ fn handle_new_job(
 
     let active_share_diff = state.current_share_difficulty.load(Ordering::Acquire);
     info!(
-        "New job: height={}, block_diff={}, template_share_diff={}, active_share_diff={}, clean={}",
+        "New job: height={}, witnesses={}, chain_length={}, credit_at={}, active_credit_at={}, clean={}",
         template.height,
         template.block_difficulty,
+        template.chain_length,
         template.share_difficulty,
         active_share_diff,
         template.clean_jobs
@@ -913,7 +749,16 @@ fn handle_new_job(
     Ok(())
 }
 
-type ShareResult = (u64, [u8; 32], Hash256, [u8; 32], Vec<u8>);
+struct ShareCandidate {
+    job_id: [u8; 32],
+    chain_length: u32,
+    /// Ascending single-use witness list.
+    witnesses: Vec<u64>,
+    /// Commitment over `parent_work_commitment`, height and the exact list.
+    work_commitment: Hash256,
+    /// Miner authorization; empty for a credit-only share.
+    block_authorization: Vec<u8>,
+}
 
 struct MiningThreadConfig {
     thread_id: usize,
@@ -922,8 +767,6 @@ struct MiningThreadConfig {
     batch_size: u64,
     connection_generation: u64,
     miner_secret: SecretKey,
-    accelerator_dir: PathBuf,
-    require_accelerator: bool,
 }
 
 struct MiningLaunchConfig {
@@ -931,15 +774,13 @@ struct MiningLaunchConfig {
     batch_size: u64,
     connection_generation: u64,
     miner_secret: SecretKey,
-    accelerator_dir: PathBuf,
-    require_accelerator: bool,
 }
 
 fn start_mining_threads(
     threads: usize,
     state: Arc<MinerState>,
     launch: MiningLaunchConfig,
-) -> tokio::sync::mpsc::UnboundedReceiver<ShareResult> {
+) -> tokio::sync::mpsc::UnboundedReceiver<ShareCandidate> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     for thread_id in 0..threads {
@@ -947,7 +788,6 @@ fn start_mining_threads(
         let state = Arc::clone(&state);
         let tx = tx.clone();
         let miner_secret = launch.miner_secret.clone();
-        let accelerator_dir = launch.accelerator_dir.clone();
 
         std::thread::spawn(move || {
             mining_thread(
@@ -958,8 +798,6 @@ fn start_mining_threads(
                     batch_size: launch.batch_size,
                     connection_generation: launch.connection_generation,
                     miner_secret,
-                    accelerator_dir,
-                    require_accelerator: launch.require_accelerator,
                 },
                 state,
                 tx,
@@ -973,7 +811,7 @@ fn start_mining_threads(
 fn mining_thread(
     config: MiningThreadConfig,
     state: Arc<MinerState>,
-    tx: tokio::sync::mpsc::UnboundedSender<ShareResult>,
+    tx: tokio::sync::mpsc::UnboundedSender<ShareCandidate>,
 ) {
     let MiningThreadConfig {
         thread_id,
@@ -982,181 +820,209 @@ fn mining_thread(
         batch_size,
         connection_generation: conn_gen,
         miner_secret,
-        accelerator_dir,
-        require_accelerator,
     } = config;
+    let identity = ChainIdentity::of(&cfg);
     info!("Mining thread {thread_id}/{thread_count} started (batch_size={batch_size})");
 
-    let accelerators = AcceleratorRegistry::discover(&accelerator_dir);
-    if require_accelerator && accelerators.available_devices() == 0 {
-        error!(
-            "mining thread {thread_id} cannot load a verified accelerator from {}",
-            accelerator_dir.display()
-        );
-        state.running.store(false, Ordering::Release);
-        return;
-    }
-
-    #[allow(unused_assignments)]
-    let mut last_gen: u64 = 0;
+    // Witnesses must be odd, so an odd per-thread offset with a stride of
+    // `2 * thread_count` partitions the candidate space exactly once.
+    let stride = 2 * thread_count as u64;
+    let mut cursor = 3 + 2 * thread_id as u64;
 
     loop {
         if !state.running.load(Ordering::Relaxed) {
             break;
         }
-        // Exit if the connection has been replaced by a new one
         if state.connection_generation.load(Ordering::Acquire) != conn_gen {
             break;
         }
 
-        let current_gen = state.job_generation.load(Ordering::Acquire);
-        let current_diff_gen = state.difficulty_generation.load(Ordering::Acquire);
-
         let job = match state.current_job.read().clone() {
-            Some(j) => j,
+            Some(job) => job,
             None => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
         };
-
-        last_gen = current_gen;
-
-        let arena = state.get_arena(job.epoch_seed, job.arena_size, job.page_size);
-        let share_iterations = state
+        let generation = state.job_generation.load(Ordering::Acquire);
+        let required = job.header.difficulty;
+        let credit_at = state
             .current_share_difficulty
             .load(Ordering::Acquire)
-            .clamp(1, job.header.difficulty);
+            .clamp(1, required);
 
-        // Pre-compute epoch kernel params once per job (same epoch → same params)
-        let epoch = EpochKernelParams::derive(arena.params.epoch_seed.as_bytes());
-
-        let base_nonce: u64 =
-            rand::random::<u64>() / thread_count as u64 * thread_count as u64 + thread_id as u64;
-
-        let mut extra_nonce: [u8; 32] = rand::random();
-        extra_nonce[0] = thread_id as u8;
-
-        let mut candidate = job.header.clone();
-        candidate.extra_nonce = extra_nonce;
-
-        for i in 0..batch_size {
-            if i & 0xFF == 0
-                && (state.job_generation.load(Ordering::Acquire) != last_gen
-                    || state.difficulty_generation.load(Ordering::Acquire) != current_diff_gen)
-            {
-                break;
+        let mut witnesses = Vec::new();
+        if credit_at < required {
+            let credit = search_witnesses(
+                &state,
+                generation,
+                job.chain_length,
+                credit_at,
+                batch_size,
+                &mut cursor,
+                stride,
+            );
+            if credit.job_changed {
+                continue;
             }
-
-            let nonce = base_nonce.wrapping_add(i * thread_count as u64);
-            candidate.nonce = nonce;
-
-            candidate.pow_commitment = Hash256::ZERO;
-            let mut performed_operations = 0u64;
-            if share_iterations < job.header.difficulty {
-                let checkpoint = match u32::try_from(share_iterations)
-                    .ok()
-                    .and_then(|iterations| evaluate_scientific_work_at(&candidate, iterations))
+            if credit.witnesses.len() as u64 == credit_at {
+                let work_commitment = hyphen_pow::vms::witness_commitment(
+                    &job.parent_work_commitment,
+                    job.header.height,
+                    &credit.witnesses,
+                );
+                state.mark_submitted(&credit.witnesses);
+                info!("Thread {thread_id}: credit share with {credit_at} witnesses");
+                witnesses = credit.witnesses;
+                if tx
+                    .send(ShareCandidate {
+                        job_id: job.job_id,
+                        chain_length: job.chain_length,
+                        witnesses: witnesses.clone(),
+                        work_commitment,
+                        block_authorization: Vec::new(),
+                    })
+                    .is_err()
                 {
-                    Some(commitment) => commitment,
-                    None => {
-                        error!("job specifies an invalid scientific checkpoint");
-                        break;
-                    }
-                };
-                let _ = tx.send((nonce, extra_nonce, checkpoint, job.job_id, Vec::new()));
-                performed_operations = performed_operations
-                    .saturating_add(operation_count(share_iterations).unwrap_or(0));
-            }
-            let work_commitment = match evaluate_candidate_work(
-                &candidate,
-                &arena,
-                &cfg,
-                &epoch,
-                &accelerators,
-                require_accelerator,
-            ) {
-                Ok(commitment) => commitment,
-                Err(error) => {
-                    error!("scientific accelerator execution failed: {error}");
-                    state.running.store(false, Ordering::Release);
                     break;
                 }
-            };
-            if work_commitment == Hash256::ZERO {
-                error!("job specifies an invalid scientific PoUW iteration count");
-                break;
             }
-            candidate.pow_commitment = work_commitment;
-            performed_operations = performed_operations
-                .saturating_add(operation_count(job.header.difficulty).unwrap_or(0));
-            state
-                .total_operations
-                .fetch_add(performed_operations, Ordering::Relaxed);
+        }
 
-            info!(
-                "Thread {thread_id}: scientific work completed nonce={nonce} commitment={}",
-                work_commitment
+        let remaining = required - witnesses.len() as u64;
+        if remaining > 0 {
+            let rest = search_witnesses(
+                &state,
+                generation,
+                job.chain_length,
+                remaining,
+                batch_size,
+                &mut cursor,
+                stride,
             );
-            let block_authorization = match BlockAuthorization::sign(
-                &candidate,
-                &cfg,
-                job.reward_view_public,
-                job.reward_spend_public,
-                &miner_secret,
-            )
-            .and_then(|authorization| {
-                wire_config(256)
-                    .serialize(&authorization)
-                    .map_err(|error| error.to_string())
-            }) {
+            if rest.job_changed || rest.witnesses.len() as u64 != remaining {
+                continue;
+            }
+            witnesses.extend(rest.witnesses);
+            witnesses.sort_unstable();
+        }
+
+        let work_commitment = hyphen_pow::vms::witness_commitment(
+            &job.parent_work_commitment,
+            job.header.height,
+            &witnesses,
+        );
+        let mut header = job.header.clone();
+        header.pow_commitment = work_commitment;
+        let block_authorization = match BlockAuthorization::sign(
+            &header,
+            identity.network_magic,
+            identity.consensus_params_hash,
+            identity.genesis_hash,
+            job.reward_view_public,
+            job.reward_spend_public,
+            &miner_secret,
+        ) {
+            Ok(authorization) => match wire_config(256).serialize(&authorization) {
                 Ok(encoded) => encoded,
                 Err(error) => {
-                    error!("refusing unsigned scientific-work result: {error}");
+                    error!("cannot serialise block authorization: {error}");
                     continue;
                 }
-            };
-            let _ = tx.send((
-                nonce,
-                extra_nonce,
+            },
+            Err(error) => {
+                error!("refusing unsigned witness result: {error}");
+                continue;
+            }
+        };
+
+        state.mark_submitted(&witnesses);
+        info!(
+            "Thread {thread_id}: block candidate height={} witnesses={}",
+            job.header.height,
+            witnesses.len()
+        );
+        if tx
+            .send(ShareCandidate {
+                job_id: job.job_id,
+                chain_length: job.chain_length,
+                witnesses,
                 work_commitment,
-                job.job_id,
                 block_authorization,
-            ));
+            })
+            .is_err()
+        {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        // A candidate only becomes a block once the pool submits it, so wait
+        // for the next job instead of burning a second list on this one.
+        while state.running.load(Ordering::Relaxed)
+            && state.connection_generation.load(Ordering::Acquire) == conn_gen
+            && state.job_generation.load(Ordering::Acquire) == generation
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     }
 
     info!("Mining thread {thread_id} stopped");
 }
 
-fn evaluate_candidate_work(
-    candidate: &BlockHeader,
-    arena: &EpochArena,
-    cfg: &ChainConfig,
-    epoch: &EpochKernelParams,
-    accelerators: &AcceleratorRegistry,
-    require_accelerator: bool,
-) -> Result<Hash256, String> {
-    if accelerators.available_devices() == 0 {
-        if require_accelerator {
-            return Err("no accelerator passed the consensus-kernel self-test".into());
-        }
-        return Ok(evaluate_pow_with_epoch(candidate, arena, cfg, epoch));
-    }
+struct WitnessSearch {
+    witnesses: Vec<u64>,
+    job_changed: bool,
+}
 
-    let iterations = difficulty_to_iterations(candidate.difficulty)
-        .ok_or("job specifies an invalid scientific PoUW iteration count")?;
-    let input = scientific_input_cells(candidate);
-    match accelerators.execute_verified(None, &input, POUW_ALPHA_Q12 as u32, iterations) {
-        Ok(execution) => scientific_output_commitment(candidate, iterations, &execution.output)
-            .ok_or_else(|| "accelerator output does not match the consensus profile".into()),
-        Err(error) if require_accelerator => Err(error),
-        Err(error) => {
-            warn!("accelerator rejected work; using Rust CPU consensus kernel: {error}");
-            Ok(evaluate_pow_with_epoch(candidate, arena, cfg, epoch))
+/// Scans this worker's residue class until `count` unclaimed witnesses are
+/// found. The cursor only moves forward, so successive calls never rescan.
+fn search_witnesses(
+    state: &Arc<MinerState>,
+    generation: u64,
+    chain_length: u32,
+    count: u64,
+    batch: u64,
+    cursor: &mut u64,
+    stride: u64,
+) -> WitnessSearch {
+    let mut witnesses: Vec<u64> = Vec::with_capacity(count as usize);
+    while (witnesses.len() as u64) < count {
+        if state.job_generation.load(Ordering::Acquire) != generation {
+            return WitnessSearch {
+                witnesses,
+                job_changed: true,
+            };
         }
+        let is_claimed = |candidate: u64| state.is_locally_claimed(candidate);
+        let params = hyphen_pow::vms::SearchParams {
+            length: chain_length,
+            offset: *cursor,
+            stride,
+            count: count - witnesses.len() as u64,
+            max_candidates: batch,
+            is_claimed: &is_claimed,
+        };
+        let outcome = match hyphen_pow::vms::search(&params) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                error!("witness search rejected: {error}");
+                return WitnessSearch {
+                    witnesses,
+                    job_changed: true,
+                };
+            }
+        };
+        state
+            .total_operations
+            .fetch_add(outcome.candidates_tested, Ordering::Relaxed);
+        witnesses.extend(outcome.witnesses);
+        *cursor = cursor.wrapping_add(stride.saturating_mul(outcome.candidates_tested.max(1)));
+        if outcome.candidates_tested == 0 {
+            break;
+        }
+    }
+    WitnessSearch {
+        witnesses,
+        job_changed: false,
     }
 }
 
@@ -1232,9 +1098,9 @@ mod tests {
         let mut payload = vec![version];
         payload.extend_from_slice(&[11u8; 32]);
         payload.extend_from_slice(&[12u8; 32]);
-        let hash = blake3::hash(&payload);
+        let hash = hyphen_crypto::blake3_hash(&payload);
         payload.extend_from_slice(&hash.as_bytes()[..4]);
-        format!("hy1{}", bs58::encode(payload).into_string())
+        format!("hy1{}", hyphen_crypto::base58::encode(&payload))
     }
 
     #[test]
@@ -1329,5 +1195,70 @@ mod tests {
                 .is_err()
         );
         assert_eq!(state.receipt_sequence.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn witness_search_returns_verifiable_single_use_chains() {
+        let cfg = ChainConfig::devnet();
+        let length = cfg.pouw_chain_length;
+        let claimed = std::sync::Mutex::new(std::collections::HashSet::new());
+        let is_claimed = |candidate: u64| claimed.lock().expect("lock").contains(&candidate);
+        let params = hyphen_pow::vms::SearchParams {
+            length,
+            offset: 3,
+            stride: 2,
+            count: 2,
+            max_candidates: 5_000_000,
+            is_claimed: &is_claimed,
+        };
+        let outcome = hyphen_pow::vms::search(&params).expect("search");
+        assert_eq!(outcome.witnesses.len(), 2);
+        hyphen_pow::vms::verify_witnesses(&outcome.witnesses, length, 2).expect("verifiable");
+        for witness in &outcome.witnesses {
+            claimed.lock().expect("lock").insert(*witness);
+        }
+
+        // Replaying the same window must skip everything already claimed.
+        let again = hyphen_pow::vms::search(&hyphen_pow::vms::SearchParams {
+            length,
+            offset: 3,
+            stride: 2,
+            count: 2,
+            max_candidates: 5_000_000,
+            is_claimed: &is_claimed,
+        })
+        .expect("search");
+        for witness in &again.witnesses {
+            assert!(!outcome.witnesses.contains(witness));
+        }
+    }
+
+    #[test]
+    fn commitment_binds_parent_height_and_exact_list() {
+        let parent = Hash256::from_bytes([9u8; 32]);
+        let witnesses = [3u64, 11u64];
+        let commitment = hyphen_pow::vms::witness_commitment(&parent, 7, &witnesses);
+        assert_eq!(
+            commitment,
+            hyphen_pow::vms::witness_commitment(&parent, 7, &witnesses)
+        );
+        assert_ne!(
+            commitment,
+            hyphen_pow::vms::witness_commitment(&parent, 8, &witnesses)
+        );
+        assert_ne!(
+            commitment,
+            hyphen_pow::vms::witness_commitment(&parent, 7, &[3u64])
+        );
+    }
+
+    #[test]
+    fn local_claim_set_blocks_self_duplicates() {
+        let state = MinerState::new();
+        assert!(!state.is_locally_claimed(3));
+        state.mark_submitted(&[3, 11]);
+        assert!(state.is_locally_claimed(3));
+        assert!(state.is_locally_claimed(11));
+        assert!(!state.is_locally_claimed(5));
     }
 }
