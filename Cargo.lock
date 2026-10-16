@@ -406,8 +406,6 @@ dependencies = [
  "hyphen-pow",
  "parking_lot",
  "prost",
- "rustbinary",
- "serde",
  "socket2",
  "thiserror",
  "tokio",
