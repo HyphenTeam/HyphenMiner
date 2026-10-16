@@ -59,6 +59,38 @@ cargo clippy --all-targets --locked -- -D warnings
 Useful flags: `--threads`, `--batch-size` (candidates per search call),
 `--allow-shared-reward-recipient` (only after reviewing the pool policy).
 
+## Mining through a proxy
+
+A miner on a network that only permits traffic to a proxy endpoint can hand that
+problem to [Corduit](https://crates.io/crates/corduit):
+
+```powershell
+.\target\release\hyphen-miner.exe --network devnet `
+    --via-proxy socks5://user:pass@proxy.internal:1080 `
+    --pool pool.example:3340 --wallet-address hy1...
+```
+
+`--via-proxy` accepts `socks5://`, `socks4://` and `http://` endpoints with
+optional `user:password` credentials. The miner starts Corduit's engine in its
+own process with a loopback `mixed` inbound, routes the pool link through the
+operator's outbound, and — because the pool name is carried as a name — lets the
+proxy resolve it instead of asking this host's resolver. Everything above the
+socket is untouched: the share protocol, the keepalive and the framing are the
+same bytes as a direct connection.
+
+Notes an operator should know:
+
+- A catch-all rule selects the operator's outbound, and the direct outbound that
+  Corduit requires to exist for its own bookkeeping is never reached by a rule.
+  A proxy that cannot be used is an error, never a silent direct connection.
+- `--via-proxy-listen 127.0.0.1:PORT` pins the loopback port instead of letting
+  the miner scan for a free one.
+- Only lawfully usable proxies: the endpoint is yours to configure and to be
+  entitled to.
+- Corduit is a hard dependency, so `--via-proxy` is always available. It brings
+  its own in-tree protocol stack; Hysteria and TUIC stay behind Corduit's opt-in
+  features and are absent from this build.
+
 ## Protocol
 
 - Block version: 5

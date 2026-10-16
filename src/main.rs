@@ -1,5 +1,6 @@
 mod primitives;
 mod protocol;
+mod proxy;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,6 +29,19 @@ struct Cli {
 
     #[arg(long, default_value = "127.0.0.1:3340")]
     pool: String,
+
+    /// Mine through an operator-provided proxy, tunnelled by Corduit.
+    ///
+    /// Format: `socks5://[user:pass@]host:port`, `socks4://…` or `http://…`.
+    /// The miner starts a loopback Corduit engine and routes the pool link
+    /// through it, so the proxy protocol (and its authentication) is Corduit's
+    /// business and the share protocol stays unchanged.
+    #[arg(long = "via-proxy", value_name = "SPEC")]
+    via_proxy: Option<String>,
+
+    /// Loopback address the tunnel listens on. Ignored without `--via-proxy`.
+    #[arg(long = "via-proxy-listen", value_name = "ADDR", default_value = "")]
+    via_proxy_listen: String,
 
     #[arg(long, default_value = "0")]
     threads: usize,
@@ -195,6 +209,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(MinerState::new());
 
+    // The pool link is dialled directly, or through a loopback Corduit engine
+    // when the operator named an outbound. Either way the pool protocol above
+    // this point is untouched: the tunnel is a stream, not a second protocol.
+    let tunnel = match cli.via_proxy.as_deref() {
+        Some(spec) => {
+            let parsed = proxy::ProxySpec::parse(spec)?;
+            let tunnel = if cli.via_proxy_listen.is_empty() {
+                proxy::PoolTunnel::start(parsed)?
+            } else {
+                let listen = cli
+                    .via_proxy_listen
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|error| {
+                        format!(
+                            "invalid --via-proxy-listen '{}': {error}",
+                            cli.via_proxy_listen
+                        )
+                    })?;
+                proxy::PoolTunnel::start_on(parsed, Some(listen))?
+            };
+            info!(
+                "Pool link tunnelled: {} -> {} (local {})",
+                tunnel.proxy_endpoint(),
+                cli.pool,
+                tunnel.local_addr()
+            );
+            Some(tunnel)
+        }
+        None => None,
+    };
+
     let wallet_pubkey = parse_wallet_address(&cli.wallet_address, &cfg)?;
     info!("Payout wallet: {}", hex_encode(wallet_pubkey));
 
@@ -208,6 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match connect_and_mine(
             &cli.pool,
+            tunnel.as_ref(),
             &sk,
             &cli.user_agent,
             &cfg,
@@ -230,6 +276,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                 backoff_secs = (backoff_secs * 2).min(120);
             }
+        }
+    }
+
+    // Leave the proxy engine's threads and loopback listener behind with the
+    // process, not with the mining loop: a stopped miner must not keep a
+    // listener bound on the operator's machine.
+    if let Some(tunnel) = tunnel {
+        if let Err(error) = tunnel.stop() {
+            warn!("Stopping the proxy engine failed: {error}");
         }
     }
 
@@ -270,6 +325,7 @@ fn parse_wallet_address(address: &str, cfg: &ChainConfig) -> Result<[u8; 64], St
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_mine(
     pool_addr: &str,
+    tunnel: Option<&proxy::PoolTunnel>,
     sk: &SecretKey,
     user_agent: &str,
     cfg: &ChainConfig,
@@ -287,7 +343,18 @@ async fn connect_and_mine(
 
     let identity = ChainIdentity::of(cfg);
 
-    let mut stream = TcpStream::connect(pool_addr).await?;
+    let mut stream = match tunnel {
+        // The SOCKS5 handshake is blocking I/O against a loopback proxy: it is
+        // bounded by the handshake timeout and must not be spliced into the
+        // reactor's async accept path. The socket is handed to tokio afterwards,
+        // so the pool link itself stays async.
+        Some(tunnel) => {
+            let proxied = tokio::task::block_in_place(|| tunnel.connect_pool(pool_addr))?;
+            proxied.set_nonblocking(true)?;
+            TcpStream::from_std(proxied)?
+        }
+        None => TcpStream::connect(pool_addr).await?,
+    };
 
     // Enable TCP keepalive to detect dead connections through NAT/firewalls.
     {
