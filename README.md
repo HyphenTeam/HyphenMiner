@@ -61,8 +61,8 @@ Useful flags: `--threads`, `--batch-size` (candidates per search call),
 
 ## Mining through a proxy
 
-A miner on a network that only permits traffic to a proxy endpoint can hand that
-problem to [Corduit](https://crates.io/crates/corduit):
+A miner on a network that only permits traffic to a proxy endpoint can still
+reach its pool:
 
 ```powershell
 .\target\release\hyphen-miner.exe --network devnet `
@@ -70,26 +70,30 @@ problem to [Corduit](https://crates.io/crates/corduit):
     --pool pool.example:3340 --wallet-address hy1...
 ```
 
-`--via-proxy` accepts `socks5://`, `socks4://` and `http://` endpoints with
-optional `user:password` credentials. The miner starts Corduit's engine in its
-own process with a loopback `mixed` inbound, routes the pool link through the
-operator's outbound, and — because the pool name is carried as a name — lets the
-proxy resolve it instead of asking this host's resolver. Everything above the
+`--via-proxy` accepts `socks5://[user:pass@]host:port` and
+`http://[user:pass@]host:port` (HTTP `CONNECT`). The miner performs that
+handshake itself — RFC 1928 with RFC 1929 authentication, or RFC 9110 §9.3.6
+with `Proxy-Authorization: Basic` — then speaks the pool protocol through the
+resulting stream. Because the pool is carried as a name, the proxy resolves it
+and this host's resolver never learns the pool address. Everything above the
 socket is untouched: the share protocol, the keepalive and the framing are the
 same bytes as a direct connection.
 
 Notes an operator should know:
 
-- A catch-all rule selects the operator's outbound, and the direct outbound that
-  Corduit requires to exist for its own bookkeeping is never reached by a rule.
-  A proxy that cannot be used is an error, never a silent direct connection.
-- `--via-proxy-listen 127.0.0.1:PORT` pins the loopback port instead of letting
-  the miner scan for a free one.
+- The endpoint is the only thing that can reach the pool. A proxy that cannot be
+  used is a startup error — the miner never falls back to a direct connection.
+- `--via-proxy` is resolved once at startup, so a typo fails before any hashing
+  begins rather than at the first reconnect after a share is lost.
+- Whatever obfuscation or egress policy you run behind that endpoint is yours:
+  [Corduit](https://crates.io/crates/corduit) exposes exactly these two inbounds
+  (`socks5`, `http`), so it works as the service this flag dials without being
+  linked into the miner — no proxy engine, no extra threads in the mining
+  process, and no library version coupling between them.
 - Only lawfully usable proxies: the endpoint is yours to configure and to be
   entitled to.
-- Corduit is a hard dependency, so `--via-proxy` is always available. It brings
-  its own in-tree protocol stack; Hysteria and TUIC stay behind Corduit's opt-in
-  features and are absent from this build.
+- Credentials belong in the spec, not in a shell history you share: prefer a
+  wrapper script or your platform's secret store over a literal command line.
 
 ## Protocol
 

@@ -1,73 +1,69 @@
-//! Operator-provided egress for the pool link, tunnelled by Corduit.
+//! Operator-provided egress for the pool link.
 //!
-//! A miner that cannot open a TCP connection to its pool — a locked-down
-//! facility network, a host that must route all traffic through a proxy
-//! endpoint — can still mine by handing that problem to Corduit:
+//! A miner that cannot open a TCP connection to its pool — a facility network
+//! that only permits traffic to a proxy endpoint, a host whose policy routes
+//! everything through one — can still mine:
 //!
 //! ```text
 //! hyphen-miner --via-proxy socks5://user:pass@proxy.internal:1080 --pool pool.example:3340 …
+//! hyphen-miner --via-proxy http://proxy.internal:3128          --pool pool.example:3340 …
 //! ```
 //!
-//! The miner starts Corduit's engine **in this process** with a loopback
-//! `mixed` inbound and the operator's outbound, then dials that loopback
-//! address and asks it for the pool. Corduit owns everything that makes a proxy
-//! hard — the protocol implementations, the router, the connection tracking, the
-//! thread pool — and the share protocol, keepalive and framing on this side are
-//! untouched: from [`PoolTunnel::local_addr`] outward the miner still speaks the
-//! pool's plain TCP dialect.
+//! The miner connects to the proxy and asks it for the pool; after that the
+//! share protocol, keepalive and framing are the same bytes a direct link sends.
+//! Two standard handshakes carry the request:
 //!
-//! ## Why the miner speaks SOCKS5 at all
+//! * **SOCKS5** (RFC 1928) with optional username/password sub-negotiation
+//!   (RFC 1929) — what an operator's SOCKS endpoint speaks, including a Corduit
+//!   `socks5` inbound.
+//! * **HTTP CONNECT** (RFC 9110 §9.3.6) with optional `Proxy-Authorization` —
+//!   what a corporate proxy speaks, including a Corduit `http` inbound.
 //!
-//! Corduit's inbounds *are* proxy endpoints: an application connects to them and
-//! asks for a destination. That is the boundary where a proxy engine is useful
-//! and also the boundary where it stays lawful — the operator configures a
-//! proxy they are entitled to use, and this crate never picks one for them. The
-//! client half of RFC 1928 lives here because it is the *interop* layer, not a
-//! proxy implementation: a greeting, an optional RFC 1929 credential exchange,
-//! one CONNECT, one reply. Every read is bounded and every failure names the
-//! response code, because "the tunnel is up but the pool is unreachable" is a
-//! diagnosis an operator has to be able to make from the log alone.
+//! Nothing here picks a proxy for the operator and nothing here is a proxy
+//! implementation: the endpoint is theirs to configure and to be entitled to, so
+//! an obfuscating proxy engine stays an external service rather than a library
+//! this binary must link.
 //!
-//! The SOCKS5 request carries the pool's **name**, not an address, whenever the
-//! operator wrote a name: the proxy resolves it, this host never does, and the
-//! pool address stays out of the miner's DNS traffic.
+//! ## Why the handshakes live in this file
+//!
+//! A proxy's *client* half is interop glue, not proxying: a greeting, one
+//! exchange, one request line. It is written here against the RFCs and tested
+//! against independent servers — never against the implementation that will sit
+//! on the far side, which would prove nothing. Every read is bounded, every
+//! failure names the response code, and "the tunnel is up but the pool is
+//! unreachable" is a diagnosis an operator can make from the log alone.
+//!
+//! The HTTP path encodes `Proxy-Authorization` with Courierust's Base64, so the
+//! one line of encoding it needs comes from a tested implementation.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use corduit::engine::{
-    Config, Corduit, GeneralConfig, InboundConfig, InboundType, Mode, OutboundConfig, OutboundType,
-    RuleConfig, RuleType,
-};
-
-/// Handshake deadline. Dialling through a proxy is a two-hop TCP open plus DNS,
-/// so this is generous compared to a direct connect, and still finite.
+/// Deadline for reaching the proxy and completing the handshake. A proxied open
+/// is two hops and a round trip, so this is generous next to a direct connect —
+/// and still finite.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// First loopback port the auto-selection tries.
-const FIRST_LOCAL_PORT: u16 = 17_890;
-
-/// How many consecutive ports the auto-selection may try before giving up.
-const LOCAL_PORT_ATTEMPTS: u16 = 64;
-
-/// SOCKS5 protocol version, and the sub-negotiation versions of RFC 1929.
 const SOCKS5_VERSION: u8 = 0x05;
 const SOCKS5_AUTH_VERSION: u8 = 0x01;
-
 const SOCKS5_METHOD_NO_AUTH: u8 = 0x00;
 const SOCKS5_METHOD_USER_PASS: u8 = 0x02;
 const SOCKS5_METHOD_NONE_ACCEPTABLE: u8 = 0xFF;
-
 const SOCKS5_CMD_CONNECT: u8 = 0x01;
-
 const SOCKS5_ATYP_IPV4: u8 = 0x01;
 const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
 const SOCKS5_ATYP_IPV6: u8 = 0x04;
 
-/// Failure to build or use the pool tunnel.
+/// Longest HTTP status line accepted from a CONNECT proxy.
+const MAX_STATUS_LINE: usize = 1024;
+
+/// Longest header block accepted from a CONNECT proxy.
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+
+/// Failure to parse a proxy spec or to open the tunnelled pool link.
 #[derive(Debug, thiserror::Error)]
-pub enum TunnelError {
+pub enum ProxyError {
     /// The `--via-proxy` value could not be understood.
     #[error("invalid --via-proxy value '{spec}': {reason}")]
     Spec {
@@ -76,29 +72,65 @@ pub enum TunnelError {
         /// What is wrong with it.
         reason: String,
     },
-    /// Corduit could not build or start the engine.
-    #[error("cannot start the local proxy engine: {0}")]
-    Engine(String),
-    /// No loopback port was free for the engine's inbound.
-    #[error("no free loopback port in {FIRST_LOCAL_PORT}..{end}")]
-    NoLocalPort {
-        /// One past the last port that was tried.
-        end: u16,
-    },
-    /// The proxy rejected the handshake.
-    #[error("proxy handshake with {proxy} failed: {reason}")]
-    Handshake {
-        /// Proxy endpoint the miner talked to.
-        proxy: SocketAddr,
-        /// Human-readable cause, including the SOCKS5 reply code when there is one.
+    /// The proxy host does not resolve.
+    #[error("proxy '{proxy}' does not resolve: {reason}")]
+    Resolve {
+        /// The proxy endpoint as written.
+        proxy: String,
+        /// Resolver error.
         reason: String,
     },
+    /// The proxy could not be reached, or the exchange broke.
+    #[error("talking to proxy '{proxy}' failed: {reason}")]
+    Transport {
+        /// The proxy endpoint.
+        proxy: String,
+        /// Transport error.
+        reason: String,
+    },
+    /// The proxy answered, and the answer was not success.
+    #[error("proxy '{proxy}' refused the tunnel to {pool}: {reason}")]
+    Refused {
+        /// The proxy endpoint.
+        proxy: String,
+        /// The pool address that was requested.
+        pool: String,
+        /// Protocol reply, decoded into words.
+        reason: String,
+    },
+    /// A reply was malformed, truncated or oversized.
+    #[error("proxy '{proxy}' sent an unusable reply: {reason}")]
+    Protocol {
+        /// The proxy endpoint.
+        proxy: String,
+        /// What was wrong with the bytes.
+        reason: String,
+    },
+}
+
+/// The protocol the operator's proxy speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyKind {
+    /// SOCKS5, RFC 1928, optional RFC 1929 authentication.
+    Socks5,
+    /// HTTP `CONNECT`, optional `Proxy-Authorization`.
+    HttpConnect,
+}
+
+impl ProxyKind {
+    /// Name for log lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            ProxyKind::Socks5 => "SOCKS5",
+            ProxyKind::HttpConnect => "HTTP CONNECT",
+        }
+    }
 }
 
 /// The operator's outbound, parsed from `--via-proxy`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxySpec {
-    outbound: OutboundType,
+    kind: ProxyKind,
     server: String,
     port: u16,
     username: Option<String>,
@@ -106,27 +138,26 @@ pub struct ProxySpec {
 }
 
 impl ProxySpec {
-    /// Parses `socks5://[user:pass@]host:port`, `socks4://…` or `http://…`.
+    /// Parses `socks5://[user:pass@]host:port` or `http://[user:pass@]host:port`.
     ///
     /// The scheme is mandatory: a bare `host:port` would be ambiguous with the
     /// pool address it sits next to on the command line, and guessing wrong
     /// would send the share protocol to a proxy as if it were the pool.
-    pub fn parse(spec: &str) -> Result<Self, TunnelError> {
-        let invalid = |reason: &str| TunnelError::Spec {
+    pub fn parse(spec: &str) -> Result<Self, ProxyError> {
+        let invalid = |reason: &str| ProxyError::Spec {
             spec: spec.to_string(),
             reason: reason.to_string(),
         };
 
         let (scheme, rest) = spec
             .split_once("://")
-            .ok_or_else(|| invalid("expected a scheme: socks5://, socks4:// or http://"))?;
-        let outbound = match scheme.to_ascii_lowercase().as_str() {
-            "socks5" | "socks" => OutboundType::Socks5,
-            "socks4" | "socks4a" => OutboundType::Socks4,
-            "http" | "https" => OutboundType::Http,
+            .ok_or_else(|| invalid("expected a scheme: socks5:// or http://"))?;
+        let kind = match scheme.to_ascii_lowercase().as_str() {
+            "socks5" | "socks" => ProxyKind::Socks5,
+            "http" | "https" => ProxyKind::HttpConnect,
             other => {
                 return Err(invalid(&format!(
-                    "unsupported proxy scheme '{other}'; use socks5://, socks4:// or http://"
+                    "unsupported proxy scheme '{other}'; use socks5:// or http://"
                 )))
             }
         };
@@ -154,7 +185,7 @@ impl ProxySpec {
             return Err(invalid("proxy host is empty"));
         }
         Ok(Self {
-            outbound,
+            kind,
             server,
             port,
             username,
@@ -166,212 +197,129 @@ impl ProxySpec {
     pub fn endpoint(&self) -> String {
         format!("{}:{}", self.server, self.port)
     }
-
-    /// Builds Corduit's typed configuration: one loopback `mixed` inbound, the
-    /// operator's outbound, and a catch-all rule so *only* that outbound carries
-    /// pool traffic.
-    ///
-    /// The rule is not decoration. Corduit's rule mode falls back to a
-    /// continent-based direct shortcut when nothing matches, and an implicit
-    /// direct egress is exactly the failure this tunnel exists to prevent: the
-    /// operator routed the miner through a proxy, and a silent bypass would leak
-    /// the pool link out of the machine they hardened. A `Match` rule placed
-    /// first wins for every connection, so "through the proxy" is a property of
-    /// the configuration rather than of the fallback order. Corduit also
-    /// requires a `DIRECT` outbound to exist for its own bookkeeping; it can
-    /// never be selected with this rule table.
-    fn engine_config(&self, local_port: u16) -> Config {
-        let mut outbound_options = std::collections::HashMap::new();
-        if let (Some(user), Some(pass)) = (&self.username, &self.password) {
-            outbound_options.insert(
-                "username".to_string(),
-                nextjson::Value::String(user.clone()),
-            );
-            outbound_options.insert(
-                "password".to_string(),
-                nextjson::Value::String(pass.clone()),
-            );
-        }
-
-        Config {
-            general: GeneralConfig {
-                mixed_port: Some(local_port),
-                bind_address: "127.0.0.1".to_string(),
-                mode: Mode::Rule,
-                ..GeneralConfig::default()
-            },
-            inbounds: vec![InboundConfig {
-                inbound_type: InboundType::Mixed,
-                tag: "hyphen-miner-egress".to_string(),
-                listen: "127.0.0.1".to_string(),
-                port: local_port,
-                options: Default::default(),
-            }],
-            outbounds: vec![
-                OutboundConfig {
-                    outbound_type: self.outbound,
-                    tag: OPERATOR_OUTBOUND.to_string(),
-                    server: Some(self.server.clone()),
-                    port: Some(self.port),
-                    options: outbound_options,
-                },
-                OutboundConfig {
-                    outbound_type: OutboundType::Direct,
-                    tag: "DIRECT".to_string(),
-                    server: None,
-                    port: None,
-                    options: Default::default(),
-                },
-            ],
-            rules: vec![RuleConfig {
-                rule_type: RuleType::Match,
-                payload: String::new(),
-                outbound: OPERATOR_OUTBOUND.to_string(),
-                process_name: None,
-                ..RuleConfig::default()
-            }],
-            ..Config::default()
-        }
-    }
 }
 
-/// Tag of the outbound the catch-all rule selects.
-const OPERATOR_OUTBOUND: &str = "pool-egress";
-
-/// A started Corduit engine plus the loopback address the pool link dials.
-pub struct PoolTunnel {
-    engine: Corduit,
-    local: SocketAddr,
+/// An operator proxy the pool link can be opened through.
+#[derive(Clone, Debug)]
+pub struct PoolProxy {
     spec: ProxySpec,
+    address: SocketAddr,
 }
 
-impl PoolTunnel {
-    /// Starts the engine, auto-selecting a free loopback port.
-    pub fn start(spec: ProxySpec) -> Result<Self, TunnelError> {
-        Self::start_on(spec, None)
-    }
-
-    /// Starts the engine on `local` when the operator named a port.
+impl PoolProxy {
+    /// Resolves the proxy endpoint once, at startup.
     ///
-    /// Without an explicit port each candidate is *attempted* rather than probed
-    /// with a throwaway bind: a probe would have to release the port before
-    /// Corduit binds it, and the gap between those two calls is a race the
-    /// operator would see as an intermittent startup failure.
-    pub fn start_on(spec: ProxySpec, local: Option<SocketAddr>) -> Result<Self, TunnelError> {
-        match local {
-            Some(address) => {
-                let port = address.port();
-                let engine = start_engine(&spec, port)?;
-                Ok(Self {
-                    engine,
-                    local: address,
-                    spec,
-                })
-            }
-            None => {
-                for port in FIRST_LOCAL_PORT..FIRST_LOCAL_PORT.saturating_add(LOCAL_PORT_ATTEMPTS) {
-                    match start_engine(&spec, port) {
-                        Ok(engine) => {
-                            return Ok(Self {
-                                engine,
-                                local: SocketAddr::from(([127, 0, 0, 1], port)),
-                                spec,
-                            })
-                        }
-                        Err(error) if is_port_conflict(&error) => continue,
-                        Err(error) => return Err(error),
-                    }
-                }
-                Err(TunnelError::NoLocalPort {
-                    end: FIRST_LOCAL_PORT.saturating_add(LOCAL_PORT_ATTEMPTS),
-                })
-            }
-        }
+    /// Resolving here means a typo in `--via-proxy` fails the miner before it
+    /// starts hashing, with the proxy named, instead of at the first reconnect.
+    pub fn new(spec: ProxySpec) -> Result<Self, ProxyError> {
+        let endpoint = spec.endpoint();
+        let address = (spec.server.as_str(), spec.port)
+            .to_socket_addrs()
+            .map_err(|error| ProxyError::Resolve {
+                proxy: endpoint.clone(),
+                reason: error.to_string(),
+            })?
+            .next()
+            .ok_or_else(|| ProxyError::Resolve {
+                proxy: endpoint.clone(),
+                reason: "no address records".to_string(),
+            })?;
+        Ok(Self { spec, address })
     }
 
-    /// The loopback address the pool link must dial.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local
-    }
-
-    /// The operator's proxy, for log lines.
-    pub fn proxy_endpoint(&self) -> String {
-        self.spec.endpoint()
-    }
-
-    /// Opens a tunnel to `pool` through the local inbound.
+    /// Opens a tunnelled connection to `pool`, or fails with the reason.
     ///
-    /// `pool` is the operator's `--pool` value, so a name stays a name: the
-    /// SOCKS5 request carries a domain and the proxy resolves it.
-    pub fn connect_pool(&self, pool: &str) -> Result<TcpStream, TunnelError> {
+    /// `pool` is the operator's `--pool` value; a name stays a name, so the
+    /// proxy resolves it and this host's resolver never learns the pool address.
+    pub fn open(&self, pool: &str) -> Result<TcpStream, ProxyError> {
+        let endpoint = self.spec.endpoint();
         let mut stream =
-            TcpStream::connect_timeout(&self.local, HANDSHAKE_TIMEOUT).map_err(|error| {
-                TunnelError::Handshake {
-                    proxy: self.local,
+            TcpStream::connect_timeout(&self.address, HANDSHAKE_TIMEOUT).map_err(|error| {
+                ProxyError::Transport {
+                    proxy: endpoint.clone(),
                     reason: error.to_string(),
                 }
             })?;
         stream
             .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
             .and_then(|()| stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT)))
-            .map_err(|error| TunnelError::Handshake {
-                proxy: self.local,
+            .map_err(|error| ProxyError::Transport {
+                proxy: endpoint.clone(),
                 reason: error.to_string(),
             })?;
 
-        negotiate_socks5(&mut stream, &self.spec, pool).map_err(|reason| {
-            TunnelError::Handshake {
-                proxy: self.local,
-                reason,
-            }
-        })?;
+        match self.spec.kind {
+            ProxyKind::Socks5 => negotiate_socks5(&mut stream, &self.spec, pool)
+                .map_err(|failure| failure.into_error(&endpoint, pool))?,
+            ProxyKind::HttpConnect => negotiate_connect(&mut stream, &self.spec, pool)
+                .map_err(|failure| failure.into_error(&endpoint, pool))?,
+        }
+
+        // The handshake deadline was the tunnel's, not the pool protocol's: a
+        // pool decides how long a share exchange takes, and a proxy must not
+        // impose its timeout on bytes that are no longer its business.
+        stream
+            .set_read_timeout(None)
+            .and_then(|()| stream.set_write_timeout(None))
+            .map_err(|error| ProxyError::Transport {
+                proxy: endpoint,
+                reason: error.to_string(),
+            })?;
         Ok(stream)
     }
 
-    /// Stops the engine. Call at shutdown; dropping does the same.
-    pub fn stop(self) -> Result<(), TunnelError> {
-        self.engine
-            .stop()
-            .map_err(|error| TunnelError::Engine(error.to_string()))
+    /// One-line description of what the pool link will do, for the startup log.
+    pub fn routing_note(&self, pool: &str) -> String {
+        format!(
+            "{} {} -> {pool}",
+            self.spec.kind.label(),
+            self.spec.endpoint()
+        )
     }
 }
 
-impl Drop for PoolTunnel {
-    fn drop(&mut self) {
-        let _ = self.engine.stop();
+/// A handshake failure, before it is attributed to a proxy and a pool.
+#[derive(Debug)]
+enum HandshakeFailure {
+    /// The proxy refused the tunnel, with its own code.
+    Refused(String),
+    /// The reply could not be used.
+    Protocol(String),
+    /// The bytes could not be exchanged.
+    Io(std::io::Error),
+}
+
+impl HandshakeFailure {
+    fn into_error(self, proxy: &str, pool: &str) -> ProxyError {
+        match self {
+            HandshakeFailure::Refused(reason) => ProxyError::Refused {
+                proxy: proxy.to_string(),
+                pool: pool.to_string(),
+                reason,
+            },
+            HandshakeFailure::Protocol(reason) => ProxyError::Protocol {
+                proxy: proxy.to_string(),
+                reason,
+            },
+            HandshakeFailure::Io(error) => ProxyError::Transport {
+                proxy: proxy.to_string(),
+                reason: error.to_string(),
+            },
+        }
     }
 }
 
-/// Builds the engine for one loopback port and starts its listener.
-fn start_engine(spec: &ProxySpec, local_port: u16) -> Result<Corduit, TunnelError> {
-    let engine = Corduit::new(spec.engine_config(local_port))
-        .map_err(|error| TunnelError::Engine(error.to_string()))?;
-    engine
-        .start()
-        .map_err(|error| TunnelError::Engine(error.to_string()))?;
-    Ok(engine)
+impl From<std::io::Error> for HandshakeFailure {
+    fn from(error: std::io::Error) -> Self {
+        HandshakeFailure::Io(error)
+    }
 }
 
-/// Whether an engine start failure is "that port is taken" rather than a real
-/// configuration error. Corduit reports a bind failure through its error chain,
-/// so the check looks for the OS error rather than a variant that could change.
-fn is_port_conflict(error: &TunnelError) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    text.contains("address already in use")
-        || text.contains("only one usage of each socket address")
-        || text.contains("os error 10048")
-        || text.contains("os error 98")
-}
+type HandshakeResult = Result<(), HandshakeFailure>;
 
 /// Performs the SOCKS5 greeting, optional credentials and CONNECT.
-///
-/// Returns a human-readable reason on failure; the caller attaches the proxy
-/// endpoint. Every read is exact-length and bounded, so a peer that answers with
-/// nothing, or with more than the protocol allows, fails the handshake instead
-/// of hanging the miner.
-fn negotiate_socks5(stream: &mut TcpStream, spec: &ProxySpec, pool: &str) -> Result<(), String> {
-    let authenticate = spec.username.is_some();
-    let greeting: &[u8] = if authenticate {
+fn negotiate_socks5(stream: &mut TcpStream, spec: &ProxySpec, pool: &str) -> HandshakeResult {
+    let greeting: &[u8] = if spec.username.is_some() {
         &[
             SOCKS5_VERSION,
             2,
@@ -381,19 +329,15 @@ fn negotiate_socks5(stream: &mut TcpStream, spec: &ProxySpec, pool: &str) -> Res
     } else {
         &[SOCKS5_VERSION, 1, SOCKS5_METHOD_NO_AUTH]
     };
-    stream
-        .write_all(greeting)
-        .map_err(|error| format!("greeting write failed: {error}"))?;
+    stream.write_all(greeting)?;
 
     let mut reply = [0u8; 2];
-    stream
-        .read_exact(&mut reply)
-        .map_err(|error| format!("greeting read failed: {error}"))?;
+    stream.read_exact(&mut reply)?;
     if reply[0] != SOCKS5_VERSION {
-        return Err(format!(
-            "proxy answered SOCKS version {} instead of {SOCKS5_VERSION}",
+        return Err(HandshakeFailure::Protocol(format!(
+            "SOCKS version {} instead of {SOCKS5_VERSION}",
             reply[0]
-        ));
+        )));
     }
     match reply[1] {
         SOCKS5_METHOD_NO_AUTH => {}
@@ -401,86 +345,160 @@ fn negotiate_socks5(stream: &mut TcpStream, spec: &ProxySpec, pool: &str) -> Res
             let (user, pass) = match (&spec.username, &spec.password) {
                 (Some(user), Some(pass)) => (user.as_bytes(), pass.as_bytes()),
                 _ => {
-                    return Err(
-                        "proxy requires username/password authentication; put credentials in \
+                    return Err(HandshakeFailure::Refused(
+                        "it requires username/password authentication; put credentials in \
                          --via-proxy (socks5://user:pass@host:port)"
-                            .into(),
-                    )
+                            .to_string(),
+                    ))
                 }
             };
             if user.len() > 255 || pass.len() > 255 {
-                return Err("credentials longer than 255 bytes are not expressible".into());
+                return Err(HandshakeFailure::Protocol(
+                    "credentials longer than 255 bytes are not expressible".to_string(),
+                ));
             }
             let mut request = Vec::with_capacity(3 + user.len() + pass.len());
             request.extend_from_slice(&[SOCKS5_AUTH_VERSION, user.len() as u8]);
             request.extend_from_slice(user);
             request.push(pass.len() as u8);
             request.extend_from_slice(pass);
-            stream
-                .write_all(&request)
-                .map_err(|error| format!("credential write failed: {error}"))?;
+            stream.write_all(&request)?;
 
             let mut auth_reply = [0u8; 2];
-            stream
-                .read_exact(&mut auth_reply)
-                .map_err(|error| format!("credential read failed: {error}"))?;
+            stream.read_exact(&mut auth_reply)?;
             if auth_reply[1] != 0x00 {
-                return Err("proxy rejected the supplied credentials".into());
+                return Err(HandshakeFailure::Refused(
+                    "it rejected the supplied credentials".to_string(),
+                ));
             }
         }
         SOCKS5_METHOD_NONE_ACCEPTABLE => {
-            return Err("proxy accepts neither no-auth nor username/password".into())
+            return Err(HandshakeFailure::Refused(
+                "it accepts neither no-auth nor username/password".to_string(),
+            ))
         }
-        other => return Err(format!("proxy selected unsupported method 0x{other:02x}")),
+        other => {
+            return Err(HandshakeFailure::Protocol(format!(
+                "it selected unsupported method 0x{other:02x}"
+            )))
+        }
     }
 
-    let destination = Destination::parse(pool)?;
+    let destination = Socks5Destination::parse(pool).map_err(HandshakeFailure::Protocol)?;
     let mut request = vec![SOCKS5_VERSION, SOCKS5_CMD_CONNECT, 0x00];
     request.extend_from_slice(&destination.encoded);
-    stream
-        .write_all(&request)
-        .map_err(|error| format!("connect write failed: {error}"))?;
+    stream.write_all(&request)?;
 
     let mut head = [0u8; 4];
-    stream
-        .read_exact(&mut head)
-        .map_err(|error| format!("connect read failed: {error}"))?;
+    stream.read_exact(&mut head)?;
     if head[1] != 0x00 {
-        return Err(format!(
-            "proxy refused CONNECT: {}",
-            socks5_reply_text(head[1])
-        ));
+        return Err(HandshakeFailure::Refused(socks5_reply_text(head[1])));
     }
-    // The bound address must be consumed before the stream carries pool bytes.
+    // The bound address belongs to the tunnel, not to the pool protocol: consume
+    // it before the stream carries pool bytes.
     let address_len = match head[3] {
         SOCKS5_ATYP_IPV4 => 4,
         SOCKS5_ATYP_IPV6 => 16,
         SOCKS5_ATYP_DOMAIN => {
             let mut length = [0u8; 1];
-            stream
-                .read_exact(&mut length)
-                .map_err(|error| format!("connect read failed: {error}"))?;
+            stream.read_exact(&mut length)?;
             usize::from(length[0])
         }
         other => {
-            return Err(format!(
-                "proxy replied with unknown address type 0x{other:02x}"
-            ))
+            return Err(HandshakeFailure::Protocol(format!(
+                "it replied with unknown address type 0x{other:02x}"
+            )))
         }
     };
     let mut discard = vec![0u8; address_len + 2];
-    stream
-        .read_exact(&mut discard)
-        .map_err(|error| format!("connect read failed: {error}"))?;
+    stream.read_exact(&mut discard)?;
     Ok(())
 }
 
+/// Performs an HTTP `CONNECT` tunnel request.
+fn negotiate_connect(stream: &mut TcpStream, spec: &ProxySpec, pool: &str) -> HandshakeResult {
+    let authority = normalise_authority(pool)
+        .ok_or_else(|| HandshakeFailure::Protocol(format!("pool '{pool}' is not host:port")))?;
+
+    let mut request = Vec::with_capacity(256);
+    request.extend_from_slice(format!("CONNECT {authority} HTTP/1.1\r\n").as_bytes());
+    request.extend_from_slice(format!("Host: {authority}\r\n").as_bytes());
+    if let (Some(user), Some(pass)) = (&spec.username, &spec.password) {
+        let token =
+            courierust::courierust_crypto::base64::encode(format!("{user}:{pass}").as_bytes());
+        request.extend_from_slice(format!("Proxy-Authorization: Basic {token}\r\n").as_bytes());
+    }
+    request.extend_from_slice(b"Proxy-Connection: keep-alive\r\n\r\n");
+    stream.write_all(&request)?;
+
+    let head = read_http_head(stream)?;
+    let status = parse_status_code(&head)
+        .ok_or_else(|| HandshakeFailure::Protocol("no HTTP status line".to_string()))?;
+    if status != 200 {
+        return Err(HandshakeFailure::Refused(format!(
+            "it answered HTTP {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Reads an HTTP response head (through the empty line) with hard size bounds.
+fn read_http_head<R: Read>(stream: &mut R) -> Result<Vec<u8>, HandshakeFailure> {
+    let mut head = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte)?;
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            return Ok(head);
+        }
+        let status_line_done = head.windows(2).any(|pair| pair == b"\r\n");
+        let limit = if status_line_done {
+            MAX_HEADER_BYTES
+        } else {
+            MAX_STATUS_LINE
+        };
+        if head.len() > limit {
+            return Err(HandshakeFailure::Protocol(format!(
+                "reply head exceeds {limit} bytes"
+            )));
+        }
+    }
+}
+
+/// Extracts the status code from `HTTP/1.1 200 Connection Established`.
+fn parse_status_code(head: &[u8]) -> Option<u16> {
+    let text = std::str::from_utf8(head).ok()?;
+    let line = text.split("\r\n").next()?;
+    let mut parts = line.split(' ');
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
+/// `host:port`, with IPv6 hosts bracketed as the CONNECT target form requires.
+fn normalise_authority(pool: &str) -> Option<String> {
+    let (host, port) = split_host_port(pool)?;
+    Some(
+        if host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_ipv6())
+        {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        },
+    )
+}
+
 /// SOCKS5 destination encoding for the pool address.
-struct Destination {
+struct Socks5Destination {
     encoded: Vec<u8>,
 }
 
-impl Destination {
+impl Socks5Destination {
     /// Encodes `host:port` as an IPv4, IPv6 or domain destination.
     fn parse(pool: &str) -> Result<Self, String> {
         let (host, port) =
@@ -545,160 +563,10 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
-    #[test]
-    fn parses_socks5_with_credentials() {
-        let spec = ProxySpec::parse("socks5://miner:s3cret@proxy.internal:1080").unwrap();
-        assert_eq!(spec.outbound, OutboundType::Socks5);
-        assert_eq!(spec.server, "proxy.internal");
-        assert_eq!(spec.port, 1080);
-        assert_eq!(spec.username.as_deref(), Some("miner"));
-        assert_eq!(spec.password.as_deref(), Some("s3cret"));
-
-        let config = spec.engine_config(17_890);
-        assert_eq!(config.general.mode, Mode::Rule);
-        assert_eq!(config.inbounds.len(), 1);
-        assert_eq!(config.inbounds[0].port, 17_890);
-        // The operator's outbound is the one the catch-all rule selects, and an
-        // outbound that could bypass it must be declared *because Corduit
-        // requires it*, never because a rule reaches it.
-        let rule = config.rules.first().expect("a catch-all rule");
-        assert_eq!(rule.rule_type, RuleType::Match);
-        assert_eq!(rule.outbound, OPERATOR_OUTBOUND);
-        assert_eq!(config.outbounds[0].tag, OPERATOR_OUTBOUND);
-        assert_eq!(
-            config.outbounds[0].server.as_deref(),
-            Some("proxy.internal")
-        );
-        assert!(!config.rules.iter().any(|rule| rule.outbound == "DIRECT"));
-    }
-
-    #[test]
-    fn parses_http_and_ipv6_authorities() {
-        let plain = ProxySpec::parse("http://proxy.internal:3128").unwrap();
-        assert_eq!(plain.outbound, OutboundType::Http);
-        assert!(plain.username.is_none());
-
-        let v6 = ProxySpec::parse("socks5://[2001:db8::1]:1080").unwrap();
-        assert_eq!(v6.server, "2001:db8::1");
-        assert_eq!(v6.port, 1080);
-    }
-
-    #[test]
-    fn rejects_specs_that_would_silently_misdial() {
-        for spec in [
-            "proxy.internal:1080",
-            "socks5://proxy.internal",
-            "socks5://user@proxy.internal:1080",
-            "socks5://:1080",
-            "socks5://proxy.internal:99999",
-            "ftp://proxy.internal:21",
-        ] {
-            assert!(
-                ProxySpec::parse(spec).is_err(),
-                "{spec} must not be accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn destination_prefers_concrete_addresses() {
-        let v4 = Destination::parse("203.0.113.9:3340").unwrap();
-        assert_eq!(v4.encoded[0], SOCKS5_ATYP_IPV4);
-        assert_eq!(&v4.encoded[1..5], &[203, 0, 113, 9]);
-        assert_eq!(&v4.encoded[5..], &3340u16.to_be_bytes());
-
-        let name = Destination::parse("pool.example:3340").unwrap();
-        assert_eq!(name.encoded[0], SOCKS5_ATYP_DOMAIN);
-        assert_eq!(name.encoded[1], "pool.example".len() as u8);
-        assert_eq!(
-            std::str::from_utf8(&name.encoded[2..2 + "pool.example".len()]).unwrap(),
-            "pool.example"
-        );
-
-        let v6 = Destination::parse("[2001:db8::2]:3340").unwrap();
-        assert_eq!(v6.encoded[0], SOCKS5_ATYP_IPV6);
-    }
-
-    #[test]
-    fn reply_codes_are_explained() {
-        assert!(socks5_reply_text(0x05).contains("connection refused"));
-        assert!(socks5_reply_text(0x42).contains("unknown"));
-    }
-
-    /// The handshake, directly against an independent SOCKS5 server: the pool
-    /// name must travel as a domain, so the proxy resolves it and this host
-    /// never does.
-    #[test]
-    fn connect_carries_the_pool_name_and_port() {
-        let proxy = StubSocks5::start(None);
-        let spec = ProxySpec::parse(&format!("socks5://{}", proxy.addr)).unwrap();
-
-        let mut stream = TcpStream::connect(proxy.addr).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        negotiate_socks5(&mut stream, &spec, "pool.example:3340").unwrap();
-        stream.write_all(b"ping").unwrap();
-        let mut reply = [0u8; 4];
-        stream.read_exact(&mut reply).unwrap();
-        assert_eq!(&reply, b"pong");
-
-        let (kind, host, port) = proxy.join();
-        assert_eq!(kind, SOCKS5_ATYP_DOMAIN);
-        assert_eq!(host, b"pool.example");
-        assert_eq!(port, 3340);
-    }
-
-    #[test]
-    fn connect_encodes_a_numeric_pool_address() {
-        let proxy = StubSocks5::start(None);
-        let spec = ProxySpec::parse(&format!("socks5://{}", proxy.addr)).unwrap();
-
-        let mut stream = TcpStream::connect(proxy.addr).unwrap();
-        negotiate_socks5(&mut stream, &spec, "203.0.113.9:3340").unwrap();
-
-        let (kind, host, port) = proxy.join();
-        assert_eq!(kind, SOCKS5_ATYP_IPV4);
-        assert_eq!(host, vec![203, 0, 113, 9]);
-        assert_eq!(port, 3340);
-    }
-
-    /// Credentials offered in `--via-proxy` are presented when the proxy asks
-    /// for them, and the handshake completes.
-    #[test]
-    fn credentials_are_presented_when_the_proxy_demands_them() {
-        let proxy = StubSocks5::start(Some(("miner", "s3cret")));
-        let spec = ProxySpec::parse(&format!("socks5://miner:s3cret@{}", proxy.addr)).unwrap();
-
-        let mut stream = TcpStream::connect(proxy.addr).unwrap();
-        negotiate_socks5(&mut stream, &spec, "pool.example:3340").unwrap();
-        proxy.join();
-    }
-
-    /// A proxy that demands credentials the operator did not supply is a
-    /// diagnosable failure, not a hang and not an unauthenticated attempt.
-    #[test]
-    fn missing_credentials_are_reported() {
-        let proxy = StubSocks5::start(Some(("miner", "s3cret")));
-        let spec = ProxySpec::parse(&format!("socks5://{}", proxy.addr)).unwrap();
-
-        let mut stream = TcpStream::connect(proxy.addr).unwrap();
-        let error = negotiate_socks5(&mut stream, &spec, "pool.example:3340")
-            .expect_err("the tunnel must refuse an unauthenticated request");
-        assert!(
-            error.contains("proxy accepts neither"),
-            "unexpected error: {error}"
-        );
-    }
-
-    /// A minimal, independent SOCKS5 server for the tests below.
+    /// An independent SOCKS5 server, written from RFC 1928 for these tests.
     ///
-    /// Deliberately not Corduit: the client half of RFC 1928 is what the unit
-    /// tests are about, and checking it against the implementation that produced
-    /// it would prove nothing. It speaks no-auth when `credentials` is `None`,
-    /// otherwise it requires method 0x02 and checks one RFC 1929 exchange. After
-    /// a successful CONNECT it echoes four bytes, and it records the destination
-    /// it was asked for.
+    /// Deliberately not the implementation that will sit on the far side in
+    /// production: checking a client against its own server proves nothing.
     struct StubSocks5 {
         addr: SocketAddr,
         seen: std::sync::mpsc::Receiver<(u8, Vec<u8>, u16)>,
@@ -715,7 +583,7 @@ mod tests {
                 client
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
-                // Greeting: version, method count, offered methods.
+
                 let mut head = [0u8; 2];
                 client.read_exact(&mut head).unwrap();
                 assert_eq!(head[0], SOCKS5_VERSION);
@@ -731,8 +599,6 @@ mod tests {
                     }
                     Some((user, pass)) => {
                         if !methods.contains(&SOCKS5_METHOD_USER_PASS) {
-                            // The protocol's own answer to "I need a method you
-                            // did not offer": none acceptable, then close.
                             client
                                 .write_all(&[SOCKS5_VERSION, SOCKS5_METHOD_NONE_ACCEPTABLE])
                                 .unwrap();
@@ -754,11 +620,10 @@ mod tests {
                         client
                             .write_all(&[SOCKS5_AUTH_VERSION, if ok { 0x00 } else { 0x01 }])
                             .unwrap();
-                        assert!(ok, "the tunnel must present the operator's credentials");
+                        assert!(ok, "the miner must present the operator's credentials");
                     }
                 }
 
-                // CONNECT: version, command, reserved, address type.
                 let mut request = [0u8; 4];
                 client.read_exact(&mut request).unwrap();
                 assert_eq!(request[0], SOCKS5_VERSION);
@@ -808,24 +673,231 @@ mod tests {
             }
         }
 
-        /// The destination the client asked for, and the payload it sent.
         fn join(mut self) -> (u8, Vec<u8>, u16) {
             self.handle.take().unwrap().join().unwrap();
             self.seen.recv().unwrap()
         }
     }
 
-    /// With the proxy unusable the tunnel refuses to start rather than quietly
-    /// dialling the pool directly. Port 0 is not a connectable destination, so this
-    /// fails immediately and independently of whatever else is listening on the
-    /// machine ? a "free port" would be taken by a parallel test instead.
+    /// An independent HTTP CONNECT proxy for these tests.
+    struct StubConnect {
+        addr: SocketAddr,
+        request: std::sync::mpsc::Receiver<String>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StubConnect {
+        fn start(status: u16) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (sender, request) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let (mut client, _) = listener.accept().unwrap();
+                client
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let head = read_http_head(&mut client).unwrap();
+                sender
+                    .send(String::from_utf8_lossy(&head).to_string())
+                    .unwrap();
+                if status == 200 {
+                    client
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .unwrap();
+                    let mut payload = [0u8; 4];
+                    if client.read_exact(&mut payload).is_ok() {
+                        client.write_all(b"pong").unwrap();
+                    }
+                } else {
+                    client
+                        .write_all(format!("HTTP/1.1 {status} Denied\r\n\r\n").as_bytes())
+                        .unwrap();
+                }
+            });
+            Self {
+                addr,
+                request,
+                handle: Some(handle),
+            }
+        }
+
+        fn join(mut self) -> String {
+            self.handle.take().unwrap().join().unwrap();
+            self.request.recv().unwrap()
+        }
+    }
+
     #[test]
-    fn unusable_proxy_is_refused_instead_of_dialling_direct() {
-        let spec = ProxySpec::parse("socks5://127.0.0.1:0").unwrap();
-        let error = PoolTunnel::start(spec)
-            .err()
-            .expect("a tunnel to port 0 must not start")
-            .to_string();
-        assert!(error.contains("proxy engine"), "unexpected error: {error}");
+    fn parses_socks5_and_http_specs() {
+        let socks = ProxySpec::parse("socks5://miner:s3cret@proxy.internal:1080").unwrap();
+        assert_eq!(socks.kind, ProxyKind::Socks5);
+        assert_eq!(socks.server, "proxy.internal");
+        assert_eq!(socks.port, 1080);
+        assert_eq!(socks.username.as_deref(), Some("miner"));
+        assert_eq!(socks.password.as_deref(), Some("s3cret"));
+
+        let http = ProxySpec::parse("http://proxy.internal:3128").unwrap();
+        assert_eq!(http.kind, ProxyKind::HttpConnect);
+        assert!(http.username.is_none());
+
+        let v6 = ProxySpec::parse("socks5://[2001:db8::1]:1080").unwrap();
+        assert_eq!(v6.server, "2001:db8::1");
+    }
+
+    #[test]
+    fn rejects_specs_that_would_silently_misdial() {
+        for spec in [
+            "proxy.internal:1080",
+            "socks5://proxy.internal",
+            "socks5://user@proxy.internal:1080",
+            "socks5://:1080",
+            "socks5://proxy.internal:99999",
+            "ftp://proxy.internal:21",
+        ] {
+            assert!(ProxySpec::parse(spec).is_err(), "{spec} must be rejected");
+        }
+    }
+
+    /// The pool name travels as a name, so the proxy resolves it and this host
+    /// never asks its own resolver for the pool.
+    #[test]
+    fn socks5_carries_the_pool_name_and_port() {
+        let stub = StubSocks5::start(None);
+        let proxy =
+            PoolProxy::new(ProxySpec::parse(&format!("socks5://{}", stub.addr)).unwrap()).unwrap();
+
+        let mut stream = proxy.open("pool.example:3340").unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream.write_all(b"ping").unwrap();
+        let mut reply = [0u8; 4];
+        stream.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"pong");
+
+        let (kind, host, port) = stub.join();
+        assert_eq!(kind, SOCKS5_ATYP_DOMAIN);
+        assert_eq!(host, b"pool.example");
+        assert_eq!(port, 3340);
+    }
+
+    #[test]
+    fn socks5_encodes_a_numeric_pool_address() {
+        let stub = StubSocks5::start(None);
+        let proxy =
+            PoolProxy::new(ProxySpec::parse(&format!("socks5://{}", stub.addr)).unwrap()).unwrap();
+
+        let mut stream = proxy.open("203.0.113.9:3340").unwrap();
+        stream.write_all(b"ping").unwrap();
+
+        let (kind, host, port) = stub.join();
+        assert_eq!(kind, SOCKS5_ATYP_IPV4);
+        assert_eq!(host, vec![203, 0, 113, 9]);
+        assert_eq!(port, 3340);
+    }
+
+    #[test]
+    fn socks5_credentials_are_presented_when_demanded() {
+        let stub = StubSocks5::start(Some(("miner", "s3cret")));
+        let proxy = PoolProxy::new(
+            ProxySpec::parse(&format!("socks5://miner:s3cret@{}", stub.addr)).unwrap(),
+        )
+        .unwrap();
+
+        let mut stream = proxy.open("pool.example:3340").unwrap();
+        stream.write_all(b"ping").unwrap();
+        stub.join();
+    }
+
+    #[test]
+    fn missing_socks5_credentials_are_reported() {
+        let stub = StubSocks5::start(Some(("miner", "s3cret")));
+        let proxy =
+            PoolProxy::new(ProxySpec::parse(&format!("socks5://{}", stub.addr)).unwrap()).unwrap();
+
+        let error = proxy.open("pool.example:3340").unwrap_err();
+        assert!(
+            matches!(error, ProxyError::Refused { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(error.to_string().contains("neither"));
+    }
+
+    #[test]
+    fn http_connect_sends_the_authority_and_credentials() {
+        let stub = StubConnect::start(200);
+        let proxy = PoolProxy::new(
+            ProxySpec::parse(&format!("http://miner:s3cret@{}", stub.addr)).unwrap(),
+        )
+        .unwrap();
+
+        let mut stream = proxy.open("pool.example:3340").unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream.write_all(b"ping").unwrap();
+        let mut reply = [0u8; 4];
+        stream.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"pong");
+
+        let request = stub.join();
+        assert!(
+            request.starts_with("CONNECT pool.example:3340 HTTP/1.1\r\n"),
+            "unexpected request head: {request}"
+        );
+        assert!(request.contains("Host: pool.example:3340\r\n"));
+        // `miner:s3cret` in Base64, produced by Courierust's encoder.
+        assert!(request.contains("Proxy-Authorization: Basic bWluZXI6czNjcmV0\r\n"));
+    }
+
+    #[test]
+    fn http_connect_refusals_are_reported_with_the_status() {
+        let stub = StubConnect::start(403);
+        let proxy =
+            PoolProxy::new(ProxySpec::parse(&format!("http://{}", stub.addr)).unwrap()).unwrap();
+
+        let error = proxy.open("pool.example:3340").unwrap_err();
+        assert!(error.to_string().contains("403"), "unexpected: {error}");
+        stub.join();
+    }
+
+    #[test]
+    fn ipv6_pool_addresses_are_bracketed_for_connect() {
+        assert_eq!(
+            normalise_authority("[2001:db8::2]:3340").unwrap(),
+            "[2001:db8::2]:3340"
+        );
+        assert_eq!(
+            normalise_authority("pool.example:3340").unwrap(),
+            "pool.example:3340"
+        );
+        assert!(normalise_authority("pool.example").is_none());
+    }
+
+    #[test]
+    fn status_codes_are_parsed_and_explained() {
+        assert_eq!(
+            parse_status_code(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
+            Some(200)
+        );
+        assert_eq!(
+            parse_status_code(b"HTTP/1.0 407 Proxy Authentication Required\r\n"),
+            Some(407)
+        );
+        assert_eq!(parse_status_code(b"not http\r\n"), None);
+        assert!(socks5_reply_text(0x05).contains("connection refused"));
+    }
+
+    /// An unreachable proxy fails before any mining starts, with the proxy
+    /// named. Port 0 is not a connectable destination, so this is immediate and
+    /// independent of whatever else is listening on the machine.
+    #[test]
+    fn unreachable_proxy_is_reported_before_any_mining() {
+        let proxy = PoolProxy::new(ProxySpec::parse("socks5://127.0.0.1:0").unwrap()).unwrap();
+        let error = proxy.open("pool.example:3340").unwrap_err();
+        assert!(
+            matches!(error, ProxyError::Transport { .. }),
+            "unexpected error: {error:?}"
+        );
     }
 }

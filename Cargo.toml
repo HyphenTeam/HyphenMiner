@@ -1,6 +1,6 @@
 [package]
 name = "hyphen-miner"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Hyphen Contributors"]
 license = "PolyForm-Strict-1.0.0"
@@ -13,18 +13,8 @@ name = "hyphen-miner"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.6.4", features = ["derive"] }
-# Proxied pool egress. Corduit brings no third-party proxy core: its protocol
-# stack is in-tree, and Hysteria/TUIC stay behind its own opt-in features.
-corduit = "0.2.7"
-# Corduit 0.2.7 builds `courierust::{TlsSettings, ClientConfig}` with struct
-# literals, and the *type* rather than the version below offers the newest
-# release, because courierust 1.0.9 added the public `profile` field to both
-# structs inside the 1.0 series, which breaks every downstream literal. 1.0.8 is
-# the newest release that still compiles. Drop this pin once corduit either
-# spells `..Default::default()` or ships a release built against 1.0.9+.
-courierust = "=1.0.8"
-nextjson = "0.1.4"
+clap = { version = "4.6.7", features = ["derive"] }
+courierust = "1.0.9"
 hyphen-core = { path = "../crates/hyphen-core" }
 hyphen-crypto = { path = "../crates/hyphen-crypto" }
 hyphen-pow = { path = "../crates/hyphen-pow" }
