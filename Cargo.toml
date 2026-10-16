@@ -17,6 +17,7 @@ clap = { version = "4.6.4", features = ["derive"] }
 hyphen-core = { path = "../crates/hyphen-core" }
 hyphen-crypto = { path = "../crates/hyphen-crypto" }
 hyphen-pow = { path = "../crates/hyphen-pow" }
+rustbinary = { version = "0.1.8", features = ["derive"] }
 parking_lot = "0.12"
 prost = "0.14.4"
 serde = { version = "1.0.229", features = ["derive"] }
