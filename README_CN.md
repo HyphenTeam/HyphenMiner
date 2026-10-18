@@ -61,33 +61,70 @@ cargo clippy --all-targets --locked -- -D warnings
 
 ## 原生加速
 
-在装有 CUDA Toolkit 的机器上构建 CUDA 插件：
+加速器是可选的共享库。Rust 矿工始终保留可移植 CPU 路径；没有插件加载成功或设备调用失败时
+会自动回退，不会因为 GPU 故障停止挖矿。
+
+### Linux + NVIDIA GPU
+
+先确认驱动和工具链：
+
+```bash
+nvidia-smi
+nvcc --version
+```
+
+`nvidia-smi` 能看到显卡，说明驱动和 GPU 已就绪；`nvcc` 可用，说明构建插件所需的 CUDA
+Toolkit 已安装。没有 GPU 直通的 KVM 虚拟机无法使用 CUDA，矿工会打印
+`Native accelerator unavailable (...); using CPU witness search` 并继续走 CPU。
+
+针对本机显卡构建插件：
+
+```bash
+cmake -S native -B native/build -DHYPHEN_ENABLE_CUDA=ON
+cmake --build native/build --config Release -j"$(nproc)"
+```
+
+`HYPHEN_CUDA_ARCHITECTURES` 默认为 `native`。如果 CMake 无法识别设备，用
+
+```bash
+nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+```
+
+读取计算能力，去掉小数点后传入，例如 `-DHYPHEN_CUDA_ARCHITECTURES=86`。如果要分发给
+其他显卡，显式设置架构列表，如 `75;80;86;89`。
+
+插件输出到 `accelerators/hyphen_backend_cuda.so`。挖矿前先与 CPU 谓词比对：
+
+```bash
+./target/release/hyphen-miner \
+  --accelerator-dir "$PWD/accelerators" \
+  accelerator-check --batch 2000000 --offset 1000001 --stride 32 --length 6
+```
+
+正常输出包含后端、设备、GPU/CPU 幸存数和完整有效链数量。幸存集合不一致、返回窗口外的值
+或插件 ABI 不匹配都会以非零状态退出；这种插件不能用于挖矿。确认无误后用同一目录启动矿工：
+
+```bash
+./target/release/hyphen-miner \
+  --accelerator-dir "$PWD/accelerators" \
+  --network devnet \
+  --pool 127.0.0.1:3340 \
+  --wallet-address hy1...
+```
+
+`--no-accelerator` 强制 CPU 路径；`HYPHEN_ACCELERATOR_DIR` 与 `--accelerator-dir`
+等价。两者任一存在时即为权威目录，不再搜索默认路径；只有都未设置时才依次查找可执行文件旁、
+当前目录和构建树中的 `accelerators/`。
+
+### Windows 与 HIP
 
 ```powershell
 cmake -S native -B native/build -DHYPHEN_ENABLE_CUDA=ON
 cmake --build native/build --config Release
 ```
 
-在装有 ROCm/HIP 的机器上构建 HIP 插件：
-
-```powershell
-cmake -S native -B native/build -DHYPHEN_ENABLE_HIP=ON
-cmake --build native/build --config Release
-```
-
-插件输出到 accelerators/。也可以用 --accelerator-dir 或 HYPHEN_ACCELERATOR_DIR 指定
-目录。HYPHEN_CUDA_ARCHITECTURES 默认是 native；HYPHEN_HIP_ARCHITECTURES 默认为空，由
-hipcc 选择。如果要分发到其他 GPU，请显式设置架构列表。
-
-挖矿前先用 CPU 谓词校验设备筛：
-
-```powershell
-cargo run --release -- accelerator-check --batch 2000000 --offset 1000001 `
-    --stride 32 --length 6
-```
-
-GPU 幸存集合与 CPU 小素数筛不一致、或插件返回窗口外的值时，命令会失败。输出包含设备
-时间、墙钟时间、幸存数与完整有效链数量。
+HIP 插件采用同样的布局：在 ROCm 主机上使用 `-DHYPHEN_ENABLE_HIP=ON` 构建。
+`HYPHEN_HIP_ARCHITECTURES` 默认为空，由 hipcc 选择本机 GPU 架构。
 
 平台行为：
 

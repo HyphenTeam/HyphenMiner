@@ -73,36 +73,81 @@ directory).
 
 ## Native accelerator
 
-Build the CUDA plugin on a machine with the CUDA toolkit:
+The accelerator is an optional shared library. The Rust miner always keeps the
+portable CPU path and falls back to it when no plugin loads or a device call
+fails.
+
+### Linux with an NVIDIA GPU
+
+Check the driver and toolkit first:
+
+```bash
+nvidia-smi
+nvcc --version
+```
+
+`nvidia-smi` proves the driver and GPU are visible; `nvcc` proves the toolkit
+needed to build the plugin is installed. A KVM guest without GPU passthrough
+cannot use CUDA. In that case the miner logs `Native accelerator unavailable
+(...); using CPU witness search` and continues on the CPU path.
+
+Build the plugin for the GPU in this machine:
+
+```bash
+cmake -S native -B native/build -DHYPHEN_ENABLE_CUDA=ON
+cmake --build native/build --config Release -j"$(nproc)"
+```
+
+`HYPHEN_CUDA_ARCHITECTURES` defaults to `native`. If CMake cannot detect the
+device, read its compute capability with
+
+```bash
+nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+```
+
+and pass it without a dot, for example `-DHYPHEN_CUDA_ARCHITECTURES=86`. Set an
+explicit list such as `75;80;86;89` for a binary you intend to distribute.
+
+The library is written to `accelerators/hyphen_backend_cuda.so`. Verify it
+against the CPU predicate before mining:
+
+```bash
+./target/release/hyphen-miner \
+  --accelerator-dir "$PWD/accelerators" \
+  accelerator-check --batch 2000000 --offset 1000001 --stride 32 --length 6
+```
+
+A clean run prints the backend, device, survivor counts and valid chain count.
+A survivor-set mismatch, an out-of-window value, or a plugin ABI mismatch exits
+non-zero; do not mine with that plugin. Then start the miner with the same
+directory:
+
+```bash
+./target/release/hyphen-miner \
+  --accelerator-dir "$PWD/accelerators" \
+  --network devnet \
+  --pool 127.0.0.1:3340 \
+  --wallet-address hy1...
+```
+
+`--no-accelerator` forces the CPU path. `HYPHEN_ACCELERATOR_DIR` is the
+environment-variable equivalent of `--accelerator-dir`: either one is
+authoritative and disables the default search paths. Without an override the
+loader tries the executable's `accelerators/` directory, the current directory's
+`accelerators/` directory, then the build-tree `accelerators/` directory.
+
+### Windows and HIP
 
 ```powershell
 cmake -S native -B native/build -DHYPHEN_ENABLE_CUDA=ON
 cmake --build native/build --config Release
 ```
 
-Build the HIP plugin on a machine with ROCm/HIP:
-
-```powershell
-cmake -S native -B native/build -DHYPHEN_ENABLE_HIP=ON
-cmake --build native/build --config Release
-```
-
-The plugins land in `accelerators/`. The loader also accepts an explicit
-`--accelerator-dir` or `HYPHEN_ACCELERATOR_DIR`. `HYPHEN_CUDA_ARCHITECTURES`
-defaults to `native`; `HYPHEN_HIP_ARCHITECTURES` is empty by default, so hipcc
-chooses. Set an explicit list for a binary you intend to distribute to other
-GPUs.
-
-Verify the device sieve against the CPU predicate before mining:
-
-```powershell
-cargo run --release -- accelerator-check --batch 2000000 --offset 1000001 `
-    --stride 32 --length 6
-```
-
-The command fails if the GPU survivor set differs from the CPU small-prime
-sieve, or if the plugin returns values outside the requested window. It reports
-device time, wall time, survivor count, and the number of fully valid chains.
+The HIP plugin uses the same layout. Build it on a ROCm host with
+`-DHYPHEN_ENABLE_HIP=ON`; `HYPHEN_HIP_ARCHITECTURES` is empty by default, so
+hipcc selects the local GPU. The loader searches the explicit directory,
+`HYPHEN_ACCELERATOR_DIR`, the executable's `accelerators/` directory, and the
+current directory's `accelerators/` directory, in that order.
 
 Platform behavior:
 

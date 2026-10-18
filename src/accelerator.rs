@@ -115,6 +115,7 @@ pub struct Accelerator {
     // Declared first: the function pointers below are only valid while the
     // library is loaded.
     _library: libloading::Library,
+    path: PathBuf,
     api: BackendApiV1,
     device: DeviceInfoV1,
     backend: String,
@@ -123,32 +124,34 @@ pub struct Accelerator {
 
 impl Accelerator {
     /// Load the first plugin that exposes a device with the Cunningham sieve
-    /// capability. `directory` overrides the default search path.
+    /// capability. An explicit `directory` or `HYPHEN_ACCELERATOR_DIR` is
+    /// authoritative; without one the default search paths are used.
     pub fn load(directory: Option<&Path>) -> Result<Self, String> {
         let mut directories = Vec::new();
-        if let Some(directory) = directory {
-            directories.push(directory.to_path_buf());
-        }
-        if let Some(directory) = std::env::var_os("HYPHEN_ACCELERATOR_DIR") {
-            directories.push(PathBuf::from(directory));
-        }
-        if let Ok(executable) = std::env::current_exe() {
-            if let Some(parent) = executable.parent() {
-                directories.push(parent.join("accelerators"));
-                directories.push(parent.join("accelerators").join("Release"));
-                directories.push(parent.to_path_buf());
+        let override_directory = directory
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HYPHEN_ACCELERATOR_DIR").map(PathBuf::from));
+        if let Some(directory) = override_directory {
+            directories.push(directory);
+        } else {
+            if let Ok(executable) = std::env::current_exe() {
+                if let Some(parent) = executable.parent() {
+                    directories.push(parent.join("accelerators"));
+                    directories.push(parent.join("accelerators").join("Release"));
+                    directories.push(parent.to_path_buf());
+                }
             }
+            if let Ok(current) = std::env::current_dir() {
+                directories.push(current.join("accelerators"));
+                directories.push(current.join("accelerators").join("Release"));
+            }
+            directories.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("accelerators"));
+            directories.push(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("accelerators")
+                    .join("Release"),
+            );
         }
-        if let Ok(current) = std::env::current_dir() {
-            directories.push(current.join("accelerators"));
-            directories.push(current.join("accelerators").join("Release"));
-        }
-        directories.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("accelerators"));
-        directories.push(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("accelerators")
-                .join("Release"),
-        );
 
         let extension = std::env::consts::DLL_EXTENSION;
         let mut problems = Vec::new();
@@ -234,11 +237,16 @@ impl Accelerator {
         let device_name = fixed_string(&device.name);
         Ok(Self {
             _library: library,
+            path: path.to_path_buf(),
             api,
             device,
             backend,
             device_name,
         })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn backend(&self) -> &str {

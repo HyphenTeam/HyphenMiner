@@ -78,7 +78,7 @@ struct Cli {
     no_accelerator: bool,
 
     /// Directory containing hyphen_backend_cuda / hyphen_backend_hip plugins.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", global = true)]
     accelerator_dir: String,
 }
 
@@ -216,7 +216,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         length,
     }) = &cli.command
     {
-        return run_accelerator_check(*batch, *offset, *stride, *length).map_err(Into::into);
+        let directory =
+            (!cli.accelerator_dir.is_empty()).then(|| PathBuf::from(&cli.accelerator_dir));
+        return run_accelerator_check(*batch, *offset, *stride, *length, directory.as_deref())
+            .map_err(Into::into);
     }
 
     let cfg = match cli.network.as_str() {
@@ -271,9 +274,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match Accelerator::load(directory.as_deref()) {
             Ok(accelerator) => {
                 info!(
-                    "Native accelerator: {} on {} ({} candidate window)",
+                    "Native accelerator: {} on {} via {} ({} candidate window)",
                     accelerator.backend(),
                     accelerator.device_name(),
+                    accelerator.path().display(),
                     accelerator.max_candidates(),
                 );
                 Some(accelerator)
@@ -1257,7 +1261,13 @@ struct WitnessSearch {
     job_changed: bool,
 }
 
-fn run_accelerator_check(batch: u32, offset: u64, stride: u64, length: u32) -> Result<(), String> {
+fn run_accelerator_check(
+    batch: u32,
+    offset: u64,
+    stride: u64,
+    length: u32,
+    accelerator_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
     let limit = hyphen_pow::SMALL_PRIME_SIEVE_LIMIT as u64;
     if offset < limit {
         return Err(format!(
@@ -1270,7 +1280,7 @@ fn run_accelerator_check(batch: u32, offset: u64, stride: u64, length: u32) -> R
     if !(hyphen_pow::MIN_CHAIN_LENGTH..=hyphen_pow::MAX_CHAIN_LENGTH).contains(&length) {
         return Err("chain length is outside the consensus range".into());
     }
-    let accelerator = Accelerator::load(None)?;
+    let accelerator = Accelerator::load(accelerator_dir)?;
     let requested = batch.clamp(1, 1 << 24);
     offset
         .checked_add(stride.saturating_mul(requested as u64 - 1))
@@ -1331,6 +1341,7 @@ fn run_accelerator_check(batch: u32, offset: u64, stride: u64, length: u32) -> R
         .count();
     println!("backend:      {}", accelerator.backend());
     println!("device:       {}", accelerator.device_name());
+    println!("plugin:       {}", accelerator.path().display());
     println!("window:       {scanned} candidates from {offset} step {stride}");
     println!("survivors:    {} GPU, {} CPU", gpu.len(), cpu.len());
     println!("valid chains: {chains}");
