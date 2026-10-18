@@ -13,11 +13,11 @@ use clap::{Parser, Subcommand};
 use parking_lot::RwLock;
 use prost::Message;
 use tokio::net::TcpStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use primitives::{
-    hex_encode, wire_config, BlockAuthorization, BlockHeader, ChainConfig, ChainIdentity, Hash256,
-    SecretKey, FROZEN_BLOCK_VERSION,
+    fill_system_random, hex_encode, wire_config, BlockAuthorization, BlockHeader, ChainConfig,
+    ChainIdentity, Hash256, SecretKey, FROZEN_BLOCK_VERSION,
 };
 use protocol::*;
 
@@ -135,7 +135,8 @@ struct MinerState {
     connection_generation: AtomicU64,
     receipt_sequence: AtomicU64,
     receipt_head: RwLock<[u8; 32]>,
-    pending_submission_hashes: RwLock<VecDeque<[u8; 32]>>,
+    /// Submissions awaiting a pool answer, with the job each belongs to.
+    pending_submission_hashes: RwLock<VecDeque<([u8; 32], [u8; 32])>>,
     /// Job generation for which a neural solution was already submitted.
     ///
     /// Every worker searches the same job concurrently; without this the
@@ -239,13 +240,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--batch-size must be greater than zero".into());
     }
 
+    let detected = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let threads = if cli.threads == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
+        // Leave one core for the node, the pool and the tunnel this miner
+        // reports to. A miner that claims every core starves them into
+        // timeouts that look like provider faults.
+        if detected > 2 {
+            detected - 1
+        } else {
+            detected
+        }
     } else {
         cli.threads
     };
+    if cli.threads == 0 && threads != detected {
+        info!(
+            "Auto thread count: {threads} of {detected} logical cores; pass --threads {detected} to claim all"
+        );
+    }
 
     let sk = if cli.key_file.is_empty() {
         let sk = SecretKey::generate();
@@ -624,7 +638,7 @@ async fn connect_and_mine(
                         }
                         MSG_SUBMIT_RESULT => {
                             let result = SubmitResult::decode(&env.payload[..])?;
-                            let submission_hash = state
+                            let (submission_hash, submitted_job) = state
                                 .pending_submission_hashes
                                 .write()
                                 .pop_front()
@@ -647,7 +661,24 @@ async fn connect_and_mine(
                                 }
                             } else {
                                 state.shares_rejected.fetch_add(1, Ordering::Relaxed);
-                                warn!("Share rejected: {}", result.error);
+                                // A rejection for a job the pool has already
+                                // replaced is the race a multi-threaded miner
+                                // cannot avoid, not a fault: the pool retired
+                                // the job while this submission was in flight.
+                                let superseded = state
+                                    .current_job
+                                    .read()
+                                    .as_ref()
+                                    .map(|job| job.job_id)
+                                    != Some(submitted_job);
+                                if superseded || result.error == POOL_STALE_JOB {
+                                    debug!(
+                                        "Share for job {} dropped: the pool had already moved on",
+                                        hex_encode(submitted_job)
+                                    );
+                                } else {
+                                    warn!("Share rejected: {}", result.error);
+                                }
                             }
                         }
                         MSG_BLOCK_FOUND => {
@@ -685,6 +716,18 @@ async fn connect_and_mine(
 
                 share = share_rx.recv() => {
                     if let Some(candidate) = share {
+                        // A candidate for a job the pool has already replaced
+                        // only earns a stale-job rejection. Dropping it here
+                        // saves a round trip and keeps the log free of a race
+                        // the miner cannot win anyway.
+                        let current_job = state
+                            .current_job
+                            .read()
+                            .as_ref()
+                            .map(|job| job.job_id);
+                        if current_job != Some(candidate.job_id) {
+                            continue;
+                        }
                         let submission = ShareSubmission {
                             job_id: candidate.job_id.to_vec(),
                             chain_length: candidate.chain_length as u64,
@@ -699,7 +742,7 @@ async fn connect_and_mine(
                             if pending.len() >= 4_096 {
                                 return Err("pool left too many share submissions unanswered".into());
                             }
-                            pending.push_back(submission_hash);
+                            pending.push_back((submission_hash, candidate.job_id));
                         }
                         let env = PoolEnvelope::sign(
                             MSG_SUBMIT,
@@ -864,27 +907,50 @@ fn handle_new_job(
         .store(template.share_difficulty, Ordering::Release);
     state.difficulty_generation.fetch_add(1, Ordering::AcqRel);
 
+    // A variable-difficulty update re-sends the same job with a new share
+    // threshold. It changes how much credit a submission earns, not the work
+    // itself, so it must not invalidate the witnesses a worker has already
+    // chained — bumping the generation here would reset every worker on every
+    // VarDiff tick and the pool would never receive a block candidate.
+    let replace = {
+        let current = state.current_job.read();
+        current
+            .as_ref()
+            .map(|existing| existing.job_id != job_id)
+            .unwrap_or(true)
+    };
+
     let active_share_diff = state.current_share_difficulty.load(Ordering::Acquire);
     info!(
-        "New job: height={}, witnesses={}, chain_length={}, credit_at={}, active_credit_at={}, clean={}",
+        "{}: height={}, witnesses={}, chain_length={}, credit_at={}, clean={}",
+        if replace {
+            "New job"
+        } else {
+            "Job threshold updated"
+        },
         template.height,
         template.block_difficulty,
         template.chain_length,
-        template.share_difficulty,
         active_share_diff,
         template.clean_jobs
     );
 
-    *state.current_job.write() = Some(job.clone());
-    state.job_generation.fetch_add(1, Ordering::Release);
+    if replace {
+        *state.current_job.write() = Some(job.clone());
+        state.job_generation.fetch_add(1, Ordering::Release);
+    }
 
     Ok(())
 }
 
+/// Rejection the pool returns when it retired the job before the share
+/// arrived. Mirrors the pool's own rejection text; a share rejected for any
+/// other reason is a real fault and stays at WARN.
+const POOL_STALE_JOB: &str = "stale job";
+
 struct ShareCandidate {
     job_id: [u8; 32],
     chain_length: u32,
-    /// Ascending single-use witness list.
     witnesses: Vec<u64>,
     /// Commitment over `parent_work_commitment`, height and the exact list.
     work_commitment: Hash256,
@@ -899,6 +965,7 @@ struct MiningThreadConfig {
     batch_size: u64,
     connection_generation: u64,
     miner_secret: SecretKey,
+    lane: SearchLane,
 }
 
 struct MiningLaunchConfig {
@@ -908,12 +975,74 @@ struct MiningLaunchConfig {
     miner_secret: SecretKey,
 }
 
+/// Width of one miner's private search lane.
+///
+/// Two miners that start at the same candidate find the same Cunningham
+/// chains, and the pool rejects every duplicate as already claimed — the same
+/// thing happens to a single miner after a restart. The lane is drawn at
+/// random, so concurrent processes and restarts never rescan the same window;
+/// a lane is wide enough for hundreds of blocks at the maximum difficulty.
+const SEARCH_LANE_CANDIDATES: u64 = 1 << 32;
+
+/// Largest origin whose complete chain still fits in a `u64`.
+///
+/// Element `k` of the chain from `n` is `n * 2^k + (2^k - 1)`. For the longest
+/// supported chain the last element must stay below `u64::MAX`, which bounds
+/// the origin. A lane drawn above this bound would scan numbers whose chain
+/// cannot be represented, and the search would run at full speed finding
+/// nothing.
+fn max_chain_origin(chain_length: u32) -> u64 {
+    let index = chain_length.saturating_sub(1).min(63);
+    // Last element is `((n + 1) << index) - 1`, the same expression
+    // `chain_element` evaluates; it must fit in a `u64`.
+    let max_n_plus_one = (1u128 << 64) >> index;
+    u64::try_from(max_n_plus_one.saturating_sub(1)).unwrap_or(u64::MAX)
+}
+
+/// A half-open candidate window `[start, end)` no other miner instance shares.
+#[derive(Clone, Copy)]
+struct SearchLane {
+    start: u64,
+    end: u64,
+}
+
+impl SearchLane {
+    fn draw(chain_length: u32) -> Self {
+        let mut bytes = [0u8; 8];
+        fill_system_random(&mut bytes);
+        Self::from_slot(u64::from_le_bytes(bytes), chain_length)
+    }
+
+    /// Slot `k` owns `[3 + k*w, 3 + (k+1)*w)`, with `w` even so every thread
+    /// offset inside the lane stays odd: chain origins above two are odd.
+    fn from_slot(slot: u64, chain_length: u32) -> Self {
+        let limit = max_chain_origin(chain_length);
+        let span = limit.saturating_sub(3);
+        let width = (SEARCH_LANE_CANDIDATES.min(span.max(2)) / 2) * 2;
+        let slots = (span / width).max(1);
+        let start = 3 + (slot % slots) * width;
+        Self {
+            start,
+            end: start.saturating_add(width).min(limit),
+        }
+    }
+
+    fn cursor(self, thread_id: usize) -> u64 {
+        self.start.saturating_add(2 * thread_id as u64)
+    }
+}
+
 fn start_mining_threads(
     threads: usize,
     state: Arc<MinerState>,
     launch: MiningLaunchConfig,
 ) -> tokio::sync::mpsc::UnboundedReceiver<ShareCandidate> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let lane = SearchLane::draw(launch.chain.pouw_chain_length);
+    info!(
+        "Search lane {}..{} is private to this miner instance",
+        lane.start, lane.end
+    );
 
     for thread_id in 0..threads {
         let cfg = launch.chain.clone();
@@ -930,6 +1059,7 @@ fn start_mining_threads(
                     batch_size: launch.batch_size,
                     connection_generation: launch.connection_generation,
                     miner_secret,
+                    lane,
                 },
                 state,
                 tx,
@@ -952,14 +1082,22 @@ fn mining_thread(
         batch_size,
         connection_generation: conn_gen,
         miner_secret,
+        lane,
     } = config;
     let identity = ChainIdentity::of(&cfg);
     info!("Mining thread {thread_id}/{thread_count} started (batch_size={batch_size})");
 
     // Witnesses must be odd, so an odd per-thread offset with a stride of
-    // `2 * thread_count` partitions the candidate space exactly once.
+    // `2 * thread_count` partitions the lane exactly once, and the lane itself
+    // is private to this process.
     let stride = 2 * thread_count as u64;
-    let mut cursor = 3 + 2 * thread_id as u64;
+    let mut lane = lane;
+    let mut cursor = lane.cursor(thread_id);
+    // Witnesses chained for the job in flight, and whether its credit share
+    // has already been handed to the pool.
+    let mut accumulated: Vec<u64> = Vec::new();
+    let mut accumulated_job: Option<[u8; 32]> = None;
+    let mut credit_sent = false;
 
     loop {
         if !state.running.load(Ordering::Relaxed) {
@@ -967,6 +1105,14 @@ fn mining_thread(
         }
         if state.connection_generation.load(Ordering::Acquire) != conn_gen {
             break;
+        }
+        if cursor >= lane.end {
+            lane = SearchLane::draw(cfg.pouw_chain_length);
+            cursor = lane.cursor(thread_id);
+            info!(
+                "Thread {thread_id}: lane exhausted, moving to {}..{}",
+                lane.start, lane.end
+            );
         }
 
         let job = match state.current_job.read().clone() {
@@ -1008,13 +1154,23 @@ fn mining_thread(
             .load(Ordering::Acquire)
             .clamp(1, required);
 
-        let mut witnesses = Vec::new();
-        if credit_at < required {
+        // Witnesses already chained for this job. They survive a
+        // share-difficulty update: a VarDiff tick only changes how much credit
+        // a submission earns, and discarding the list here is what let a jumpy
+        // controller starve the pool of block candidates.
+        if accumulated_job != Some(job.job_id) {
+            accumulated.clear();
+            accumulated_job = Some(job.job_id);
+            credit_sent = false;
+        }
+
+        if (accumulated.len() as u64) < credit_at {
+            let need = credit_at - accumulated.len() as u64;
             let credit = search_witnesses(
                 &state,
                 generation,
                 job.chain_length,
-                credit_at,
+                need,
                 batch_size,
                 &mut cursor,
                 stride,
@@ -1022,31 +1178,44 @@ fn mining_thread(
             if credit.job_changed {
                 continue;
             }
-            if credit.witnesses.len() as u64 == credit_at {
-                let work_commitment = hyphen_pow::vms::witness_commitment(
-                    &job.parent_work_commitment,
-                    job.header.height,
-                    &credit.witnesses,
-                );
-                state.mark_submitted(&credit.witnesses);
-                info!("Thread {thread_id}: credit share with {credit_at} witnesses");
-                witnesses = credit.witnesses;
-                if tx
-                    .send(ShareCandidate {
-                        job_id: job.job_id,
-                        chain_length: job.chain_length,
-                        witnesses: witnesses.clone(),
-                        work_commitment,
-                        block_authorization: Vec::new(),
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+            accumulated.extend(credit.witnesses);
+            accumulated.sort_unstable();
+        }
+
+        // One credit share per job: it has to reach the threshold that is
+        // active on the pool right now, and the block candidate reuses the same
+        // witnesses afterwards.
+        if !credit_sent && credit_at < required && (accumulated.len() as u64) >= credit_at {
+            // Re-check the generation after the search: the pool may have
+            // moved on while this worker was chaining witnesses, and a
+            // submission for a retired job only earns a stale-job rejection.
+            if state.job_generation.load(Ordering::Acquire) != generation {
+                continue;
+            }
+            let credit_list: Vec<u64> = accumulated[..credit_at as usize].to_vec();
+            let work_commitment = hyphen_pow::vms::witness_commitment(
+                &job.parent_work_commitment,
+                job.header.height,
+                &credit_list,
+            );
+            state.mark_submitted(&credit_list);
+            credit_sent = true;
+            info!("Thread {thread_id}: credit share with {credit_at} witnesses");
+            if tx
+                .send(ShareCandidate {
+                    job_id: job.job_id,
+                    chain_length: job.chain_length,
+                    witnesses: credit_list,
+                    work_commitment,
+                    block_authorization: Vec::new(),
+                })
+                .is_err()
+            {
+                break;
             }
         }
 
-        let remaining = required - witnesses.len() as u64;
+        let remaining = required.saturating_sub(accumulated.len() as u64);
         if remaining > 0 {
             let rest = search_witnesses(
                 &state,
@@ -1057,12 +1226,18 @@ fn mining_thread(
                 &mut cursor,
                 stride,
             );
-            if rest.job_changed || rest.witnesses.len() as u64 != remaining {
+            if rest.job_changed {
                 continue;
             }
-            witnesses.extend(rest.witnesses);
-            witnesses.sort_unstable();
+            accumulated.extend(rest.witnesses);
+            accumulated.sort_unstable();
         }
+        if (accumulated.len() as u64) < required {
+            continue;
+        }
+        let witnesses = std::mem::take(&mut accumulated);
+        accumulated_job = None;
+        credit_sent = false;
 
         let work_commitment = hyphen_pow::vms::witness_commitment(
             &job.parent_work_commitment,
@@ -1092,6 +1267,10 @@ fn mining_thread(
                 continue;
             }
         };
+
+        if state.job_generation.load(Ordering::Acquire) != generation {
+            continue;
+        }
 
         state.mark_submitted(&witnesses);
         info!(
@@ -1627,6 +1806,67 @@ mod tests {
                 .is_err()
         );
         assert_eq!(state.receipt_sequence.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn search_lanes_are_disjoint_odd_and_partitioned_per_thread() {
+        let length = ChainConfig::devnet().pouw_chain_length;
+        let first = SearchLane::from_slot(0, length);
+        let second = SearchLane::from_slot(1, length);
+        assert_eq!(first.start % 2, 1, "chain origins must be odd");
+        assert_eq!(second.start % 2, 1, "chain origins must be odd");
+        assert_eq!(
+            second.start, first.end,
+            "consecutive slots must not overlap or leave a gap"
+        );
+
+        let drawn = SearchLane::draw(length);
+        assert_eq!(drawn.start % 2, 1);
+        assert!(drawn.end > drawn.start);
+
+        // Threads inside one process take disjoint residue classes and never
+        // leave the lane.
+        let thread_count = 4usize;
+        let stride = 2 * thread_count as u64;
+        let mut residues = std::collections::HashSet::new();
+        for thread_id in 0..thread_count {
+            let cursor = first.cursor(thread_id);
+            assert_eq!(cursor % 2, 1);
+            assert!(cursor < first.end);
+            assert!(
+                residues.insert(cursor % stride),
+                "threads must not share candidates"
+            );
+        }
+    }
+
+    /// A lane drawn above the representable chain range would scan at full
+    /// speed finding nothing: `n * 2^k + (2^k - 1)` must stay below
+    /// `u64::MAX`, which bounds the origin.
+    #[test]
+    fn every_lane_stays_inside_the_representable_chain_range() {
+        for length in hyphen_pow::vms::MIN_CHAIN_LENGTH..=hyphen_pow::vms::MAX_CHAIN_LENGTH {
+            let limit = max_chain_origin(length);
+            for slot in [0u64, 1, 7, u64::MAX] {
+                let lane = SearchLane::from_slot(slot, length);
+                assert!(lane.end > lane.start);
+                assert_eq!(lane.start % 2, 1);
+                assert!(
+                    lane.start.saturating_add(2) <= limit,
+                    "lane start for length {length} is outside the representable range"
+                );
+            }
+            assert!(
+                hyphen_pow::vms::chain_element(limit, length - 1).is_some(),
+                "the largest lane origin must still produce a representable chain"
+            );
+            if let Some(next) = limit.checked_add(1) {
+                assert!(
+                    hyphen_pow::vms::chain_element(next, length - 1).is_none(),
+                    "the bound must be tight at length {length}"
+                );
+            }
+        }
     }
 
     #[test]
