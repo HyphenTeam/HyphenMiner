@@ -6,9 +6,11 @@ pool, chain identity, or block version that does not match the compiled
 consensus constants.
 
 Consensus types, hashing, keys, and the wire profile are not reimplemented here.
-`hyphen-core`, `hyphen-crypto`, `hyphen-pow`, and `hyphen-transport` are path
-dependencies, so a consensus change reaches the miner with the node instead of
-being copied and forgotten.
+`hyphen-core`, `hyphen-crypto`, and `hyphen-pow` are consumed from the public
+Hyphen revision `576bc67d972d1156fbabb1ddf579104d5ff2ff88` pinned in `Cargo.toml`
+and `Cargo.lock`, so a consensus change reaches the miner by bumping that
+revision instead of being copied and forgotten. There is no path dependency on a
+base-chain checkout: CI builds this repository from a clean clone.
 
 ## What the miner computes
 

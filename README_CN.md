@@ -5,8 +5,9 @@ Cunningham 素数链。它使用 Pool Protocol v6，并拒绝任何与已编译�
 矿池、链身份或区块版本。
 
 共识类型、哈希、密钥与 wire 编码在这里不再重复实现：hyphen-core、hyphen-crypto、
-hyphen-pow、hyphen-transport 以路径依赖引入，共识改动会随节点一起到达矿工，而不是
-被抄一份然后被遗忘。
+hyphen-pow 通过 `Cargo.toml` 与 `Cargo.lock` 钉定的公开 Hyphen revision
+`576bc67d972d1156fbabb1ddf579104d5ff2ff88` 引入，共识改动通过升级该 revision 到达矿工，
+而不是被抄一份然后被遗忘。这里没有指向主链本地检出的路径依赖：CI 从干净克隆构建本仓库。
 
 ## 矿工在算什么
 
