@@ -8,10 +8,10 @@ Cunningham 素数链。它使用 Pool Protocol v6，并拒绝任何与已编译�
 见证是否有效：它只返回通过筛法的候选，Rust 侧对每个候选执行确定性 Miller-Rabin 与本地
 单次使用检查。
 
-共识类型、哈希、密钥与 wire 编码在这里不再重复实现：矿工通过同级的 `crates/` 目录
-构建 `HyphenTeam/Hyphen` 的共识实现。CI 与发布工作流会先把 `../Cargo.toml` 和
-`../crates` 物化到同级目录，再开始构建。这样矿工和共识实现处于同一测试面，而不是各自
-维护一份可能漂移的快照；基础链源码不会被复制进本仓库。
+共识类型、哈希、密钥与 wire 编码在这里不再重复实现：hyphen-core、hyphen-crypto、
+hyphen-pow、hyphen-neural 通过 `Cargo.toml` 与 `Cargo.lock` 钉定到公开 Hyphen revision
+`c57f908464df6634eba829e8267f9c5330b3a4b4`。这里没有指向主链本地检出的路径依赖，CI
+从干净克隆构建本仓库。共识变更通过升级该 revision 到达矿工，而不是复制代码。
 
 ## 矿工在算什么
 

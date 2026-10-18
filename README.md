@@ -11,12 +11,12 @@ whether a witness is valid: it returns sieve survivors, and the Rust side runs
 deterministic Miller-Rabin plus the local single-use check on every survivor.
 
 Consensus types, hashing, keys, and the wire profile are not reimplemented here.
-The miner builds against the sibling `crates/` tree from `HyphenTeam/Hyphen`:
-`../Cargo.toml` and `../crates` are materialized by CI and the release workflow
-before the build. That keeps the miner and the consensus implementation in one
-test surface instead of a copied snapshot; a consensus change is tested here
-before either repository is released. The base tree is never vendored into this
-repository.
+`hyphen-core`, `hyphen-crypto`, `hyphen-pow`, and `hyphen-neural` are consumed
+from the public Hyphen revision
+`c57f908464df6634eba829e8267f9c5330b3a4b4` pinned in `Cargo.toml` and
+`Cargo.lock`. There is no path dependency on a base-chain checkout: CI builds
+this repository from a clean clone. A consensus change reaches the miner by
+bumping that revision, not by copying code.
 
 ## What the miner computes
 
