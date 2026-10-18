@@ -19,14 +19,27 @@ function(hyphen_configure_plugin target output_name)
     PREFIX ""
     OUTPUT_NAME "${output_name}"
     RUNTIME_OUTPUT_DIRECTORY "${HYPHEN_PLUGIN_OUTPUT_DIR}"
-    LIBRARY_OUTPUT_DIRECTORY "${HYPHEN_PLUGIN_OUTPUT_DIR}")
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${HYPHEN_PLUGIN_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${HYPHEN_PLUGIN_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${HYPHEN_PLUGIN_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${HYPHEN_PLUGIN_OUTPUT_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${HYPHEN_PLUGIN_OUTPUT_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY_DEBUG "${HYPHEN_PLUGIN_OUTPUT_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY_RELEASE "${HYPHEN_PLUGIN_OUTPUT_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${HYPHEN_PLUGIN_OUTPUT_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${HYPHEN_PLUGIN_OUTPUT_DIR}")
 endfunction()
 
 if(HYPHEN_ENABLE_CUDA)
   enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
   add_library(hyphen_cuda SHARED cuda/hyphen_cuda.cu)
   target_compile_features(hyphen_cuda PRIVATE cxx_std_17 cuda_std_17)
-  set_target_properties(hyphen_cuda PROPERTIES CUDA_ARCHITECTURES native)
+  target_link_libraries(hyphen_cuda PRIVATE CUDA::cudart)
+  set(HYPHEN_CUDA_ARCHITECTURES "native" CACHE STRING
+      "CUDA architectures for the miner plugin (for example 75;86;89)")
+  set_target_properties(hyphen_cuda PROPERTIES
+    CUDA_ARCHITECTURES "${HYPHEN_CUDA_ARCHITECTURES}")
   hyphen_configure_plugin(hyphen_cuda hyphen_backend_cuda)
 endif()
 
@@ -36,6 +49,12 @@ if(HYPHEN_ENABLE_HIP)
   target_compile_features(hyphen_hip PRIVATE cxx_std_17)
   target_link_libraries(hyphen_hip PRIVATE hip::host)
   set_source_files_properties(hip/hyphen_hip.cpp PROPERTIES LANGUAGE HIP)
+  set(HYPHEN_HIP_ARCHITECTURES "" CACHE STRING
+      "HIP architectures for the miner plugin (for example gfx1030;gfx1100); empty lets hipcc choose")
+  if(HYPHEN_HIP_ARCHITECTURES)
+    set_target_properties(hyphen_hip PROPERTIES
+      HIP_ARCHITECTURES "${HYPHEN_HIP_ARCHITECTURES}")
+  endif()
   hyphen_configure_plugin(hyphen_hip hyphen_backend_hip)
 endif()
 

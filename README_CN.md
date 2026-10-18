@@ -4,10 +4,14 @@ Hyphen Miner 搜索 Hyphen 区块版本 5（PoUW v3）的有用工作量证明�
 Cunningham 素数链。它使用 Pool Protocol v6，并拒绝任何与已编译共识常量不一致的
 矿池、链身份或区块版本。
 
-共识类型、哈希、密钥与 wire 编码在这里不再重复实现：hyphen-core、hyphen-crypto、
-hyphen-pow 通过 `Cargo.toml` 与 `Cargo.lock` 钉定的公开 Hyphen revision
-`576bc67d972d1156fbabb1ddf579104d5ff2ff88` 引入，共识改动通过升级该 revision 到达矿工，
-而不是被抄一份然后被遗忘。这里没有指向主链本地检出的路径依赖：CI 从干净克隆构建本仓库。
+见证搜索始终保留可移植的 CPU 实现，并可选使用原生 CUDA 或 HIP 小素数筛。加速器不决定
+见证是否有效：它只返回通过筛法的候选，Rust 侧对每个候选执行确定性 Miller-Rabin 与本地
+单次使用检查。
+
+共识类型、哈希、密钥与 wire 编码在这里不再重复实现：矿工通过同级的 `crates/` 目录
+构建 `HyphenTeam/Hyphen` 的共识实现。CI 与发布工作流会先把 `../Cargo.toml` 和
+`../crates` 物化到同级目录，再开始构建。这样矿工和共识实现处于同一测试面，而不是各自
+维护一份可能漂移的快照；基础链源码不会被复制进本仓库。
 
 ## 矿工在算什么
 
@@ -31,12 +35,14 @@ pouw_chain_length 个元素内全为素数。链长由网络固定并随 job 下
 ## 文件
 
 - src/main.rs — 连接、job 处理、见证搜索、份额提交
+- src/accelerator.rs — 原生插件 ABI 加载器与 CPU 回退
 - src/protocol.rs — Pool Protocol v6 信封与消息
 - src/primitives.rs — canonical 再导出，这里没有任何共识实现
-- native/ — 已退役的 v2 扩散场内核，仅保留 C++/CUDA 源码
+- native/ — CUDA 与 HIP Cunningham 筛插件（ABI v2，kernel 3）
 
-没有任何代码路径会加载 native/。它实现的 v2 扩散场已不在共识中，因此矿工不做任何设备
-加速声明；源码保留供未来的筛法加速搜索使用。
+原生插件只实现候选窗口上的小素数筛，是可选共享库，从 accelerators/ 或
+HYPHEN_ACCELERATOR_DIR 加载。插件缺失、设备不受支持或设备报错都会把工作线程切回 CPU
+路径；验证强度不会降低。
 
 ## 构建与运行
 
@@ -50,7 +56,51 @@ cargo clippy --all-targets --locked -- -D warnings
 ```
 
 常用参数：--threads、--batch-size（每次搜索的候选数）、
---allow-shared-reward-recipient（仅在审阅矿池策略后使用）。
+--allow-shared-reward-recipient（仅在审阅矿池策略后使用）、--no-accelerator（强制 CPU）、
+--accelerator-dir（插件目录）。
+
+## 原生加速
+
+在装有 CUDA Toolkit 的机器上构建 CUDA 插件：
+
+```powershell
+cmake -S native -B native/build -DHYPHEN_ENABLE_CUDA=ON
+cmake --build native/build --config Release
+```
+
+在装有 ROCm/HIP 的机器上构建 HIP 插件：
+
+```powershell
+cmake -S native -B native/build -DHYPHEN_ENABLE_HIP=ON
+cmake --build native/build --config Release
+```
+
+插件输出到 accelerators/。也可以用 --accelerator-dir 或 HYPHEN_ACCELERATOR_DIR 指定
+目录。HYPHEN_CUDA_ARCHITECTURES 默认是 native；HYPHEN_HIP_ARCHITECTURES 默认为空，由
+hipcc 选择。如果要分发到其他 GPU，请显式设置架构列表。
+
+挖矿前先用 CPU 谓词校验设备筛：
+
+```powershell
+cargo run --release -- accelerator-check --batch 2000000 --offset 1000001 `
+    --stride 32 --length 6
+```
+
+GPU 幸存集合与 CPU 小素数筛不一致、或插件返回窗口外的值时，命令会失败。输出包含设备
+时间、墙钟时间、幸存数与完整有效链数量。
+
+平台行为：
+
+| 平台 | 后端 | 回退 |
+|---|---|---|
+| Linux x86_64/aarch64 | CUDA 或 HIP 插件 | CPU |
+| Windows x86_64 | CUDA 或 HIP 插件 | CPU |
+| macOS | 不构建 | CPU |
+| Android arm64/armv7 | 不构建 | CPU |
+| RISC-V | 不构建 | CPU |
+
+CPU 搜索是所有目标上的规范路径。macOS Metal、Android Adreno 与其他 NPU/DSP 后端尚未接入
+本二进制；这里不对它们做加速承诺。
 
 ## 协议
 

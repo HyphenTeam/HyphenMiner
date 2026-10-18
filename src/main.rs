@@ -1,11 +1,14 @@
+mod accelerator;
 mod primitives;
 mod protocol;
 mod proxy;
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use accelerator::Accelerator;
 use clap::{Parser, Subcommand};
 use parking_lot::RwLock;
 use prost::Message;
@@ -43,7 +46,11 @@ struct Cli {
     #[arg(long, default_value = "0")]
     threads: usize,
 
-    #[arg(long, value_parser = ["mainnet", "testnet", "devnet"], default_value = "devnet")]
+    #[arg(
+        long,
+        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet"],
+        default_value = "devnet"
+    )]
     network: String,
 
     #[arg(long, default_value = "")]
@@ -65,6 +72,14 @@ struct Cli {
     /// settlement wallet. The exact reward keys remain miner-authorized.
     #[arg(long, default_value_t = false)]
     allow_shared_reward_recipient: bool,
+
+    /// Disable native accelerator plugins and use the portable CPU search.
+    #[arg(long, default_value_t = false)]
+    no_accelerator: bool,
+
+    /// Directory containing hyphen_backend_cuda / hyphen_backend_hip plugins.
+    #[arg(long, default_value = "")]
+    accelerator_dir: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -74,6 +89,21 @@ enum Commands {
         /// Output file path for the 32-byte secret key
         #[arg(long, default_value = "miner.key")]
         output: String,
+    },
+    /// Compare the native Cunningham sieve with the portable CPU sieve
+    AcceleratorCheck {
+        /// Candidates scanned in one call
+        #[arg(long, default_value = "1000000")]
+        batch: u32,
+        /// First candidate (must be odd and above the small-prime bound)
+        #[arg(long, default_value = "4101")]
+        offset: u64,
+        /// Distance between candidates
+        #[arg(long, default_value = "2")]
+        stride: u64,
+        /// Cunningham chain length
+        #[arg(long, default_value = "6")]
+        length: u32,
     },
 }
 
@@ -106,10 +136,25 @@ struct MinerState {
     receipt_sequence: AtomicU64,
     receipt_head: RwLock<[u8; 32]>,
     pending_submission_hashes: RwLock<VecDeque<[u8; 32]>>,
+    /// Job generation for which a neural solution was already submitted.
+    ///
+    /// Every worker searches the same job concurrently; without this the
+    /// second one to finish burns a full solution on a submission the pool
+    /// classifies as a stale job.
+    neural_solution_generation: AtomicU64,
+    /// Native sieve plugin, when one was found and accepted the ABI.
+    accelerator: Option<Accelerator>,
+    /// Set after the first device error so every worker falls back to CPU.
+    accelerator_failed: AtomicBool,
 }
 
 impl MinerState {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_accelerator(None)
+    }
+
+    fn with_accelerator(accelerator: Option<Accelerator>) -> Self {
         Self {
             current_job: RwLock::new(None),
             job_generation: AtomicU64::new(0),
@@ -126,6 +171,9 @@ impl MinerState {
             receipt_sequence: AtomicU64::new(0),
             receipt_head: RwLock::new([0u8; 32]),
             pending_submission_hashes: RwLock::new(VecDeque::new()),
+            neural_solution_generation: AtomicU64::new(u64::MAX),
+            accelerator,
+            accelerator_failed: AtomicBool::new(false),
         }
     }
 
@@ -161,10 +209,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Some(Commands::AcceleratorCheck {
+        batch,
+        offset,
+        stride,
+        length,
+    }) = &cli.command
+    {
+        return run_accelerator_check(*batch, *offset, *stride, *length).map_err(Into::into);
+    }
+
     let cfg = match cli.network.as_str() {
         "mainnet" => ChainConfig::mainnet(),
         "testnet" => ChainConfig::testnet(),
         "devnet" => ChainConfig::devnet(),
+        "neural-devnet" => ChainConfig::neural_devnet(),
         _ => unreachable!("clap validates network"),
     };
 
@@ -204,7 +263,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.pool, threads, cfg.network_name
     );
 
-    let state = Arc::new(MinerState::new());
+    let accelerator = if cli.no_accelerator {
+        None
+    } else {
+        let directory =
+            (!cli.accelerator_dir.is_empty()).then(|| PathBuf::from(&cli.accelerator_dir));
+        match Accelerator::load(directory.as_deref()) {
+            Ok(accelerator) => {
+                info!(
+                    "Native accelerator: {} on {} ({} candidate window)",
+                    accelerator.backend(),
+                    accelerator.device_name(),
+                    accelerator.max_candidates(),
+                );
+                Some(accelerator)
+            }
+            Err(error) => {
+                info!("Native accelerator unavailable ({error}); using CPU witness search");
+                None
+            }
+        }
+    };
+
+    let state = Arc::new(MinerState::with_accelerator(accelerator));
 
     // The pool link is dialled directly, or through the operator's proxy when
     // one was named. Either way the pool protocol above this point is
@@ -678,7 +759,12 @@ fn handle_new_job(
     if template.share_difficulty > template.block_difficulty {
         return Err("share difficulty cannot exceed block difficulty".into());
     }
-    if template.chain_length != cfg.pouw_chain_length as u64 {
+    // The Cunningham chain length is inert on the neural profile; the work
+    // challenge has its own shape and the pool does not send a chain length for
+    // it.
+    if !cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK)
+        && template.chain_length != cfg.pouw_chain_length as u64
+    {
         return Err(format!(
             "pool sent chain length {} but this network fixes {}/{} elements",
             template.chain_length,
@@ -692,7 +778,11 @@ fn handle_new_job(
     {
         return Err("network configuration has an unsupported chain length".into());
     }
-    if template.block_difficulty > hyphen_pow::vms::MAX_WITNESSES_PER_BLOCK {
+    // On the neural profile this field is an acceptance threshold, not a witness
+    // count, so the witness-count ceiling does not apply.
+    if !cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK)
+        && template.block_difficulty > hyphen_pow::vms::MAX_WITNESSES_PER_BLOCK
+    {
         return Err("pool requested more witnesses than a block may claim".into());
     }
     if template.parent_work_commitment.len() != 32 {
@@ -883,6 +973,31 @@ fn mining_thread(
             }
         };
         let generation = state.job_generation.load(Ordering::Acquire);
+
+        if cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK) {
+            if let Err(error) = mine_neural_block(
+                &cfg,
+                &state,
+                &job,
+                generation,
+                thread_id,
+                thread_count,
+                &tx,
+                &miner_secret,
+            ) {
+                error!("Thread {thread_id}: {error}");
+            }
+            // A solution only becomes a block once the pool submits it, so wait
+            // for the next job instead of burning a second solution.
+            while state.running.load(Ordering::Relaxed)
+                && state.connection_generation.load(Ordering::Acquire) == conn_gen
+                && state.job_generation.load(Ordering::Acquire) == generation
+            {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            continue;
+        }
+
         let required = job.header.difficulty;
         let credit_at = state
             .current_share_difficulty
@@ -1006,9 +1121,228 @@ fn mining_thread(
     info!("Mining thread {thread_id} stopped");
 }
 
+/// Largest batch of candidates searched before the thread re-checks for a new
+/// job. One candidate is one forward pass, so this bounds the latency between a
+/// new job arriving and the search noticing.
+const NEURAL_WORK_BATCH: u64 = 32_768;
+
+/// Searches the one-way neural work challenge and submits one solution.
+///
+/// The challenge is fully determined by public data — the parent hash, the
+/// height, the miner key and the header's threshold — so the search is a plain
+/// forward-pass loop. Each thread walks its own counter residue class, which
+/// keeps workers disjoint without coordination.
+#[allow(clippy::too_many_arguments)]
+fn mine_neural_block(
+    cfg: &ChainConfig,
+    state: &Arc<MinerState>,
+    job: &MiningJob,
+    generation: u64,
+    thread_id: usize,
+    thread_count: usize,
+    tx: &tokio::sync::mpsc::UnboundedSender<ShareCandidate>,
+    miner_secret: &hyphen_crypto::SecretKey,
+) -> Result<(), String> {
+    let identity = ChainIdentity::of(cfg);
+    let spec = hyphen_neural::PROFILE_SPEC;
+    let miner_pubkey = *miner_secret.public_key().as_bytes();
+    let parent_hash = job.header.prev_hash;
+    let seed = hyphen_core::neural_work_seed(&parent_hash, job.header.height, &miner_pubkey);
+    let descriptor = hyphen_neural::WorkDescriptor {
+        epoch: job.header.height,
+        spec,
+        threshold: job.header.difficulty,
+        chain_seed: *seed.as_bytes(),
+    };
+    descriptor
+        .validate()
+        .map_err(|error| format!("pool sent an unusable work descriptor: {error}"))?;
+
+    let mut weights = vec![0_i64; spec.weight_count()];
+    descriptor
+        .derive_weights(&mut weights)
+        .map_err(|error| format!("cannot derive work weights: {error}"))?;
+    let mut solution = vec![0_i64; spec.input_dim as usize];
+    let mut hidden = vec![0_i64; spec.hidden_dim as usize];
+    let mut output = vec![0_i64; spec.output_dim as usize];
+    let mut scratch = vec![0_i64; spec.input_dim as usize];
+
+    let stride = thread_count.max(1) as u64;
+    let mut counter = thread_id as u64;
+    let mut attempts: u64 = 0;
+    loop {
+        // `generation` moves whenever the job is replaced, and the outer loop
+        // owns the connection check, so this is the whole stop condition. A
+        // sibling worker that already solved this job stops us from spending a
+        // second solution the pool would reject as a stale job.
+        if !state.running.load(Ordering::Relaxed)
+            || state.job_generation.load(Ordering::Acquire) != generation
+            || state.neural_solution_generation.load(Ordering::Acquire) == generation
+        {
+            return Ok(());
+        }
+        let outcome = hyphen_neural::search_work(
+            &descriptor,
+            &weights,
+            counter,
+            stride,
+            NEURAL_WORK_BATCH,
+            &mut solution,
+            &mut hidden,
+            &mut output,
+            &mut scratch,
+        )
+        .map_err(|error| format!("work search failed: {error}"))?;
+        attempts = attempts.saturating_add(outcome.attempts);
+        state
+            .total_operations
+            .fetch_add(outcome.attempts, Ordering::Relaxed);
+        if outcome.found {
+            break;
+        }
+        counter = counter.wrapping_add(stride.saturating_mul(NEURAL_WORK_BATCH));
+    }
+
+    // Claim the job before submitting: the first worker to finish wins and the
+    // rest stop at their next loop check.
+    if state
+        .neural_solution_generation
+        .swap(generation, Ordering::AcqRel)
+        == generation
+    {
+        return Ok(());
+    }
+
+    let witnesses: Vec<u64> = solution.iter().map(|value| *value as u64).collect();
+    let commitment = hyphen_core::neural_work_commitment(
+        &parent_hash,
+        job.header.height,
+        job.header.difficulty,
+        &miner_pubkey,
+        &witnesses,
+    );
+
+    let mut header = job.header.clone();
+    header.pow_commitment = commitment;
+    let authorization = BlockAuthorization::sign(
+        &header,
+        identity.network_magic,
+        identity.consensus_params_hash,
+        identity.genesis_hash,
+        job.reward_view_public,
+        job.reward_spend_public,
+        miner_secret,
+    )
+    .map_err(|error| format!("cannot sign the block authorization: {error}"))?;
+    let block_authorization = wire_config(256)
+        .serialize(&authorization)
+        .map_err(|error| format!("cannot serialise the block authorization: {error}"))?;
+
+    info!(
+        "Thread {thread_id}: neural solution at height {} after {attempts} attempts",
+        job.header.height
+    );
+    tx.send(ShareCandidate {
+        job_id: job.job_id,
+        chain_length: job.chain_length,
+        witnesses,
+        work_commitment: commitment,
+        block_authorization,
+    })
+    .map_err(|_| "submission channel closed".to_string())
+}
+
 struct WitnessSearch {
     witnesses: Vec<u64>,
     job_changed: bool,
+}
+
+fn run_accelerator_check(batch: u32, offset: u64, stride: u64, length: u32) -> Result<(), String> {
+    let limit = hyphen_pow::SMALL_PRIME_SIEVE_LIMIT as u64;
+    if offset < limit {
+        return Err(format!(
+            "offset must be at least {limit}; below the sieve bound an element can equal a sieve prime"
+        ));
+    }
+    if stride == 0 {
+        return Err("stride must be non-zero".into());
+    }
+    if !(hyphen_pow::MIN_CHAIN_LENGTH..=hyphen_pow::MAX_CHAIN_LENGTH).contains(&length) {
+        return Err("chain length is outside the consensus range".into());
+    }
+    let accelerator = Accelerator::load(None)?;
+    let requested = batch.clamp(1, 1 << 24);
+    offset
+        .checked_add(stride.saturating_mul(requested as u64 - 1))
+        .ok_or_else(|| "candidate window overflows u64".to_string())?;
+    // Warm the CUDA/HIP context so the measured scan is not dominated by
+    // first-call initialization.
+    let warmup = requested.min(1_024);
+    let _ = accelerator.scan(offset, stride, warmup, length, warmup)?;
+    let started = std::time::Instant::now();
+    let outcome = accelerator.scan(offset, stride, requested, length, requested)?;
+    let elapsed = started.elapsed();
+    let scanned = outcome.scanned.max(1);
+
+    let mut cpu = Vec::new();
+    for index in 0..scanned as u64 {
+        let candidate = offset + index * stride;
+        if hyphen_pow::vms::passes_small_prime_sieve(candidate, length) {
+            cpu.push(candidate);
+        }
+    }
+
+    let mut gpu = Vec::with_capacity(outcome.survivors.len());
+    for candidate in &outcome.survivors {
+        let relative = candidate.checked_sub(offset).ok_or_else(|| {
+            format!("accelerator returned {candidate}, below the requested window")
+        })?;
+        if relative % stride != 0 || relative / stride >= scanned as u64 {
+            return Err(format!(
+                "accelerator returned {candidate}, outside the requested window"
+            ));
+        }
+        if hyphen_pow::vms::chain_element(*candidate, length - 1).is_some() {
+            gpu.push(*candidate);
+        }
+    }
+    gpu.sort_unstable();
+    cpu.sort_unstable();
+
+    if !outcome.truncated && gpu != cpu {
+        let first = gpu
+            .iter()
+            .zip(&cpu)
+            .find(|(left, right)| left != right)
+            .map(|(left, right)| format!("GPU has {left}, CPU has {right}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "GPU returned {} survivors, CPU returned {}",
+                    gpu.len(),
+                    cpu.len()
+                )
+            });
+        return Err(format!("accelerator sieve mismatch: {first}"));
+    }
+
+    let chains = gpu
+        .iter()
+        .filter(|candidate| hyphen_pow::vms::chain_is_valid(**candidate, length))
+        .count();
+    println!("backend:      {}", accelerator.backend());
+    println!("device:       {}", accelerator.device_name());
+    println!("window:       {scanned} candidates from {offset} step {stride}");
+    println!("survivors:    {} GPU, {} CPU", gpu.len(), cpu.len());
+    println!("valid chains: {chains}");
+    println!(
+        "device time:  {:.3} ms",
+        outcome.device_time_ns as f64 / 1e6
+    );
+    println!("wall time:    {:.3} ms", elapsed.as_secs_f64() * 1e3);
+    if outcome.truncated {
+        println!("note: survivor buffer was truncated; exact CPU comparison skipped");
+    }
+    Ok(())
 }
 
 /// Scans this worker's residue class until `count` unclaimed witnesses are
@@ -1030,6 +1364,55 @@ fn search_witnesses(
                 job_changed: true,
             };
         }
+
+        let accelerator_ready = *cursor >= hyphen_pow::SMALL_PRIME_SIEVE_LIMIT as u64;
+        if accelerator_ready && !state.accelerator_failed.load(Ordering::Acquire) {
+            if let Some(accelerator) = state.accelerator.as_ref() {
+                let scanned = batch.min(accelerator.max_candidates() as u64).max(1) as u32;
+                let missing = count - witnesses.len() as u64;
+                let max_survivors = missing
+                    .saturating_mul(8)
+                    .saturating_add(1_024)
+                    .clamp(1, scanned as u64) as u32;
+                match accelerator.scan(*cursor, stride, scanned, chain_length, max_survivors) {
+                    Ok(outcome) => {
+                        state
+                            .total_operations
+                            .fetch_add(scanned as u64, Ordering::Relaxed);
+                        let truncated = outcome.truncated;
+                        for candidate in outcome.survivors {
+                            if witnesses.contains(&candidate)
+                                || !hyphen_pow::vms::chain_is_valid_after_sieve(
+                                    candidate,
+                                    chain_length,
+                                )
+                                || state.is_locally_claimed(candidate)
+                            {
+                                continue;
+                            }
+                            witnesses.push(candidate);
+                            if witnesses.len() as u64 == count {
+                                break;
+                            }
+                        }
+                        *cursor = cursor.wrapping_add(stride.saturating_mul(scanned as u64));
+                        if truncated && (witnesses.len() as u64) < count {
+                            warn!(
+                                target: "hyphen::miner",
+                                "Accelerator survivor window truncated at candidate {}",
+                                *cursor
+                            );
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!("Native accelerator disabled after device error: {error}");
+                        state.accelerator_failed.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         let is_claimed = |candidate: u64| state.is_locally_claimed(candidate);
         let params = hyphen_pow::vms::SearchParams {
             length: chain_length,

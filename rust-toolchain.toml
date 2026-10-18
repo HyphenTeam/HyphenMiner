@@ -1,4 +1,3 @@
-# Keep this in sync with the toolchain installed by .github/workflows/ci.yml.
 [toolchain]
 channel = "1.97.0"
-components = ["clippy", "rustfmt", "rust-src"]
+components = ["clippy", "rustfmt", "rust-src", "rust-analyzer"]

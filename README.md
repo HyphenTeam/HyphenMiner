@@ -5,12 +5,18 @@ single-use Cunningham prime chains. It speaks Pool Protocol v6 and refuses any
 pool, chain identity, or block version that does not match the compiled
 consensus constants.
 
+The witness search always has a portable CPU implementation and can optionally
+use a native CUDA or HIP small-prime sieve. The accelerator never decides
+whether a witness is valid: it returns sieve survivors, and the Rust side runs
+deterministic Miller-Rabin plus the local single-use check on every survivor.
+
 Consensus types, hashing, keys, and the wire profile are not reimplemented here.
-`hyphen-core`, `hyphen-crypto`, and `hyphen-pow` are consumed from the public
-Hyphen revision `576bc67d972d1156fbabb1ddf579104d5ff2ff88` pinned in `Cargo.toml`
-and `Cargo.lock`, so a consensus change reaches the miner by bumping that
-revision instead of being copied and forgotten. There is no path dependency on a
-base-chain checkout: CI builds this repository from a clean clone.
+The miner builds against the sibling `crates/` tree from `HyphenTeam/Hyphen`:
+`../Cargo.toml` and `../crates` are materialized by CI and the release workflow
+before the build. That keeps the miner and the consensus implementation in one
+test surface instead of a copied snapshot; a consensus change is tested here
+before either repository is released. The base tree is never vendored into this
+repository.
 
 ## What the miner computes
 
@@ -39,13 +45,15 @@ their own.
 ## Files
 
 - `src/main.rs` — connection, jobs, witness search, share submission
+- `src/accelerator.rs` — runtime ABI loader and CPU fallback
 - `src/protocol.rs` — Pool Protocol v6 envelope and messages
 - `src/primitives.rs` — canonical re-exports; no consensus code lives here
-- `native/` — retired v2 diffusion kernels, kept as C++/CUDA source only
+- `native/` — CUDA and HIP Cunningham sieve plugins (ABI v2, kernel 3)
 
-No code path loads `native/`. The v2 diffusion field it implements no longer
-exists in consensus, so the miner makes no device-acceleration claim; the
-sources are kept for a future sieve-accelerated search.
+The native plugins implement only the small-prime sieve over a candidate window.
+They are optional shared libraries, loaded from `accelerators/` or from
+`HYPHEN_ACCELERATOR_DIR`. A missing plugin, an unsupported device, or a device
+error switches the worker to the CPU path; it never weakens verification.
 
 ## Build and run
 
@@ -59,7 +67,56 @@ cargo clippy --all-targets --locked -- -D warnings
 ```
 
 Useful flags: `--threads`, `--batch-size` (candidates per search call),
-`--allow-shared-reward-recipient` (only after reviewing the pool policy).
+`--allow-shared-reward-recipient` (only after reviewing the pool policy),
+`--no-accelerator` (force the CPU path), and `--accelerator-dir` (plugin
+directory).
+
+## Native accelerator
+
+Build the CUDA plugin on a machine with the CUDA toolkit:
+
+```powershell
+cmake -S native -B native/build -DHYPHEN_ENABLE_CUDA=ON
+cmake --build native/build --config Release
+```
+
+Build the HIP plugin on a machine with ROCm/HIP:
+
+```powershell
+cmake -S native -B native/build -DHYPHEN_ENABLE_HIP=ON
+cmake --build native/build --config Release
+```
+
+The plugins land in `accelerators/`. The loader also accepts an explicit
+`--accelerator-dir` or `HYPHEN_ACCELERATOR_DIR`. `HYPHEN_CUDA_ARCHITECTURES`
+defaults to `native`; `HYPHEN_HIP_ARCHITECTURES` is empty by default, so hipcc
+chooses. Set an explicit list for a binary you intend to distribute to other
+GPUs.
+
+Verify the device sieve against the CPU predicate before mining:
+
+```powershell
+cargo run --release -- accelerator-check --batch 2000000 --offset 1000001 `
+    --stride 32 --length 6
+```
+
+The command fails if the GPU survivor set differs from the CPU small-prime
+sieve, or if the plugin returns values outside the requested window. It reports
+device time, wall time, survivor count, and the number of fully valid chains.
+
+Platform behavior:
+
+| Platform | Backend | Fallback |
+|---|---|---|
+| Linux x86_64/aarch64 | CUDA or HIP plugin | CPU |
+| Windows x86_64 | CUDA or HIP plugin | CPU |
+| macOS | none built | CPU |
+| Android arm64/armv7 | none built | CPU |
+| RISC-V | none built | CPU |
+
+The CPU search is the canonical path on every target. macOS Metal, Android
+Adreno, and other NPU/DSP backends are not wired into this binary; no
+acceleration claim is made for them.
 
 ## Mining through a proxy
 
