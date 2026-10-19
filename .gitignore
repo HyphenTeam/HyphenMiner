@@ -1,3 +1,6 @@
 /target
 /native/build-*/
 /accelerators/*
+
+# Local release staging produced by hand; never part of the source tree.
+/dist
