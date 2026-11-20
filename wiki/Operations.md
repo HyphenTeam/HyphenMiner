@@ -20,6 +20,8 @@ For ROCm, select `-DHYPHEN_ENABLE_HIP=ON` and run the same comparison. The check
 
 The miner retains at most two queued candidates and 16 unacknowledged submissions. Reconnect starts a fresh session while preserving the running process's witness claims. Large claim sets spill to temporary storage. Restarting the process clears these local claims. The pool and chain independently check prior use.
 
+For neural work use `--network neural-devnet --accelerator-dir ./accelerators`. The CUDA plugin derives candidates and scores them in batches of up to 32,768. The miner recomputes the winning score in Rust. Each solution log identifies the backend and search duration. To compare entire GPU score windows on your device, set `HYPHEN_ACCELERATOR_DIR` to the plugin directory and run `cargo test --release --locked native_neural_windows_match_rust -- --ignored`.
+
 ## 中文说明
 
 首次运行 `cargo run --release --locked -- keygen --output miner.key` 创建签名身份，之后使用 `--key-file miner.key` 复用。`--wallet-address` 指定收款地址。标准开发网按新增的坎宁安见证记份额，同一矿工可以把自己的份额扩展为完整区块候选。`neural-devnet` 的每个有效解都是完整候选，矿池须使用 SOLO。标准网共享结算需核对矿池钱包后显式传入 `--allow-shared-reward-recipient`。
@@ -27,3 +29,5 @@ The miner retains at most two queued candidates and 16 unacknowledged submission
 使用 `--threads` 限制 CPU 线程数。上面的 CMake 命令构建 CUDA 插件，ROCm 主机改用 `-DHYPHEN_ENABLE_HIP=ON`。`accelerator-check` 在本机对照 CPU 结果；`--no-accelerator` 强制使用 CPU。代理可选 SOCKS5 或 HTTP CONNECT，`--pool` 始终填写矿池地址。
 
 矿工最多排队两个候选，同时等待最多 16 个提交回执。同一进程重连时保留见证去重记录，记录增大后转入临时文件；进程重启后由矿池及链上记录继续判重。
+
+使用 `--network neural-devnet --accelerator-dir ./accelerators` 可启用 CUDA 神经工作量搜索。每批最多派生并计算 32,768 个候选，矿工用 Rust 复算达标候选的分数，日志记录实际后端和搜索耗时。将 `HYPHEN_ACCELERATOR_DIR` 指向插件目录，运行 `cargo test --release --locked native_neural_windows_match_rust -- --ignored` 可在本机逐项核对完整窗口。

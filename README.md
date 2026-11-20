@@ -2,7 +2,7 @@
 
 [简体中文](README_CN.md)
 
-Hyphen Miner searches for verifiable work and submits signed shares to a Hyphen pool. The portable CPU backend supports the standard and neural devnets. Optional CUDA and HIP plugins accelerate the Cunningham search on supported hardware.
+Hyphen Miner searches for verifiable work and submits signed shares to a Hyphen pool. The portable CPU backend supports the standard and neural devnets. CUDA and HIP plugins accelerate the Cunningham search. The CUDA plugin also scores neural work on `neural-devnet`, with Rust verification of each winning score.
 
 ## Mine on devnet
 

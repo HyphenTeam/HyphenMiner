@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-Hyphen Miner 搜索可验证的工作量，并向 Hyphen 矿池提交签名份额。CPU 后端支持标准开发网和神经工作量开发网。在支持的硬件上，CUDA 或 HIP 插件可以加速坎宁安素数链搜索。
+Hyphen Miner 搜索可验证的工作量，并向 Hyphen 矿池提交签名份额。CPU 后端支持标准开发网和神经工作量开发网。CUDA 和 HIP 插件可加速坎宁安素数链搜索。CUDA 插件也支持 `neural-devnet` 的候选评分，矿工用 Rust 复算达到阈值的候选后签名提交。
 
 ## 在开发网挖矿
 

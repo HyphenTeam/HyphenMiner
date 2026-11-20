@@ -1,11 +1,5 @@
-//! Runtime loader for the optional native PoUW sieve plugins.
-//!
-//! The consensus-critical verification stays in Rust. A plugin only receives a
-//! candidate window and returns the values that survive the same small-prime
-//! sieve that [`hyphen_pow::vms::passes_small_prime_sieve`] implements. The
-//! miner then runs deterministic Miller-Rabin and single-use checks on every
-//! returned value, so a broken or malicious plugin can lose work but cannot
-//! make the miner accept an invalid block.
+//! Runtime loader for the native Cunningham sieve and neural work plugins.
+//! The miner checks candidate witnesses and winning neural scores in Rust.
 
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -13,6 +7,9 @@ use std::ptr;
 const ACCELERATOR_ABI_VERSION: u32 = 2;
 const KERNEL_CUNNINGHAM_SIEVE: u32 = 3;
 const CAP_CUNNINGHAM_SIEVE: u64 = 1 << 2;
+const KERNEL_NEURAL_WORK: u32 = 4;
+const CAP_NEURAL_WORK: u64 = 1 << 3;
+pub const NEURAL_WINDOW: u32 = 32768;
 const MAX_CANDIDATES_PER_CALL: u32 = 1 << 24;
 const HEADER_BYTES: usize = 16;
 
@@ -86,6 +83,16 @@ struct CunninghamSieveHeaderV1 {
     truncated: u64,
 }
 
+#[repr(C)]
+struct NeuralWorkRequestV1 {
+    start: u64,
+    stride: u64,
+    candidates: u32,
+    reserved: u32,
+    seed_words: [u32; 8],
+    weights: [i64; 2128],
+}
+
 type EnumerateDevices = unsafe extern "C" fn(*mut DeviceInfoV1, u32, *mut u32) -> i32;
 type Execute = unsafe extern "C" fn(*const ExecuteRequestV1, *mut ExecuteResultV1) -> i32;
 type FreeResult = unsafe extern "C" fn(*mut u8, usize);
@@ -123,10 +130,12 @@ pub struct Accelerator {
 }
 
 impl Accelerator {
-    /// Load the first plugin that exposes a device with the Cunningham sieve
-    /// capability. An explicit `directory` or `HYPHEN_ACCELERATOR_DIR` is
-    /// authoritative; without one the default search paths are used.
-    pub fn load(directory: Option<&Path>) -> Result<Self, String> {
+    pub fn load(directory: Option<&Path>, neural: bool) -> Result<Self, String> {
+        let capability = if neural {
+            CAP_NEURAL_WORK
+        } else {
+            CAP_CUNNINGHAM_SIEVE
+        };
         let mut directories = Vec::new();
         let override_directory = directory
             .map(Path::to_path_buf)
@@ -161,7 +170,7 @@ impl Accelerator {
                 if !path.is_file() {
                     continue;
                 }
-                match Self::load_file(&path) {
+                match Self::load_file(&path, capability) {
                     Ok(accelerator) => return Ok(accelerator),
                     Err(error) => problems.push(format!("{}: {error}", path.display())),
                 }
@@ -175,7 +184,7 @@ impl Accelerator {
         }
     }
 
-    fn load_file(path: &Path) -> Result<Self, String> {
+    fn load_file(path: &Path, capability: u64) -> Result<Self, String> {
         let library = unsafe { libloading::Library::new(path) }
             .map_err(|error| format!("cannot load {}: {error}", path.display()))?;
         let get_api: libloading::Symbol<'_, GetApi> = unsafe {
@@ -223,11 +232,11 @@ impl Accelerator {
         let device = devices
             .into_iter()
             .find(|device| {
-                device.capability_mask & CAP_CUNNINGHAM_SIEVE != 0
+                device.capability_mask & capability != 0
                     && device.hardware_accelerated != 0
                     && (device.struct_size as usize) >= std::mem::size_of::<DeviceInfoV1>()
             })
-            .ok_or_else(|| "no device advertises the Cunningham sieve capability".to_string())?;
+            .ok_or_else(|| format!("no device advertises capability {capability:#x}"))?;
 
         let backend = if fixed_string(&device.backend).is_empty() {
             fixed_string(&api.backend)
@@ -288,40 +297,15 @@ impl Accelerator {
             max_survivors,
             reserved: 0,
         };
-        let execute = self
-            .api
-            .execute
-            .ok_or_else(|| "accelerator has no execute entry point".to_string())?;
-        let mut result = ExecuteResultV1 {
-            struct_size: std::mem::size_of::<ExecuteResultV1>() as u32,
-            output: ptr::null_mut(),
-            output_len: 0,
-            operation_count: 0,
-            device_time_ns: 0,
-        };
-        let request_image = ExecuteRequestV1 {
-            struct_size: std::mem::size_of::<ExecuteRequestV1>() as u32,
-            kernel_id: KERNEL_CUNNINGHAM_SIEVE,
-            device_ordinal: self.device.device_ordinal,
-            iterations: chain_length,
-            alpha_q12: 0,
-            reserved: 0,
-            input: (&request as *const CunninghamSieveRequestV1).cast::<u8>(),
-            input_len: std::mem::size_of::<CunninghamSieveRequestV1>(),
-        };
-
-        let status = unsafe { execute(&request_image, &mut result) };
-        if status != 0 {
-            return Err(self.last_error());
-        }
-        if result.output.is_null() || result.output_len < HEADER_BYTES {
-            self.free(result.output, result.output_len);
-            return Err("accelerator returned a malformed result".into());
-        }
-
-        let parsed = unsafe { self.parse_result(&result, max_survivors, candidates) };
-        self.free(result.output, result.output_len);
-        let mut outcome = parsed?;
+        let mut outcome =
+            self.execute(KERNEL_CUNNINGHAM_SIEVE, chain_length, &request, |result| {
+                if result.output_len < HEADER_BYTES
+                    || result.operation_count != u64::from(candidates)
+                {
+                    return Err("accelerator returned an incomplete sieve result".into());
+                }
+                unsafe { self.parse_result(result, max_survivors, candidates) }
+            })?;
         for candidate in &outcome.survivors {
             if *candidate < offset
                 || *candidate > window_end
@@ -335,6 +319,89 @@ impl Accelerator {
         outcome.survivors.sort_unstable();
         outcome.survivors.dedup();
         Ok(outcome)
+    }
+
+    pub fn neural_scores(
+        &self,
+        descriptor: &hyphen_neural::WorkDescriptor,
+        weights: &[i64],
+        start: u64,
+        stride: u64,
+        candidates: u32,
+    ) -> Result<Vec<u64>, String> {
+        if descriptor.spec != hyphen_neural::PROFILE_SPEC
+            || stride == 0
+            || !(1..=NEURAL_WINDOW).contains(&candidates)
+        {
+            return Err("unsupported neural search window".into());
+        }
+        let mut seed_words = [0; 8];
+        for (word, bytes) in seed_words
+            .iter_mut()
+            .zip(descriptor.chain_seed.as_chunks::<4>().0)
+        {
+            *word = u32::from_le_bytes(*bytes);
+        }
+        let request = NeuralWorkRequestV1 {
+            start,
+            stride,
+            candidates,
+            reserved: 0,
+            seed_words,
+            weights: weights
+                .try_into()
+                .map_err(|_| "invalid neural weight count")?,
+        };
+        self.execute(KERNEL_NEURAL_WORK, 1, &request, |result| {
+            if result.operation_count != u64::from(candidates)
+                || result.output_len != candidates as usize * 8
+            {
+                return Err("accelerator returned an incomplete score window".into());
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(result.output, result.output_len) };
+            Ok(bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|word| u64::from_ne_bytes(*word))
+                .collect())
+        })
+    }
+
+    fn execute<I, T>(
+        &self,
+        kernel_id: u32,
+        iterations: u32,
+        input: &I,
+        parse: impl FnOnce(&ExecuteResultV1) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let request = ExecuteRequestV1 {
+            struct_size: size_of::<ExecuteRequestV1>() as u32,
+            kernel_id,
+            device_ordinal: self.device.device_ordinal,
+            iterations,
+            alpha_q12: 0,
+            reserved: 0,
+            input: ptr::from_ref(input).cast(),
+            input_len: size_of::<I>(),
+        };
+        let mut result = ExecuteResultV1 {
+            struct_size: size_of::<ExecuteResultV1>() as u32,
+            output: ptr::null_mut(),
+            output_len: 0,
+            operation_count: 0,
+            device_time_ns: 0,
+        };
+        let execute = self.api.execute.ok_or("missing execute entry point")?;
+        if unsafe { execute(&request, &mut result) } != 0 {
+            return Err(self.last_error());
+        }
+        if result.output.is_null() {
+            return Err("accelerator returned no output".into());
+        }
+        let parsed = parse(&result);
+        self.free(result.output, result.output_len);
+        parsed
     }
 
     unsafe fn parse_result(
@@ -404,5 +471,47 @@ const _: () = {
     assert!(std::mem::size_of::<ExecuteResultV1>() == 40);
     assert!(std::mem::size_of::<CunninghamSieveHeaderV1>() == 16);
     assert!(std::mem::size_of::<CunninghamSieveRequestV1>() == 32);
+    assert!(size_of::<NeuralWorkRequestV1>() == 17080);
     assert!(std::mem::size_of::<BackendApiV1>() == 72);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a device advertising kernel 4 and its plugin"]
+    fn native_neural_windows_match_rust() {
+        let device = Accelerator::load(None, true).unwrap();
+        for (epoch, start, stride, count) in [
+            (0, 0, 1, 1),
+            (7, u64::MAX - 17, 11, 8193),
+            (300, 100, 4, NEURAL_WINDOW),
+        ] {
+            let descriptor = hyphen_neural::WorkDescriptor {
+                epoch,
+                spec: hyphen_neural::PROFILE_SPEC,
+                threshold: 1_000_000,
+                chain_seed: std::array::from_fn(|i| (i as u8).wrapping_add(epoch as u8)),
+            };
+            let mut weights = vec![0; descriptor.spec.weight_count()];
+            descriptor.derive_weights(&mut weights).unwrap();
+            let scores = device
+                .neural_scores(&descriptor, &weights, start, stride, count)
+                .unwrap();
+            assert_eq!(scores.len(), count as usize);
+            let (mut input, mut hidden, mut output) = ([0; 16], [0; 64], [0; 16]);
+            for (i, score) in scores.into_iter().enumerate() {
+                let counter = start.wrapping_add((i as u64).wrapping_mul(stride));
+                descriptor.candidate(counter, &mut input).unwrap();
+                assert_eq!(
+                    descriptor
+                        .score(&weights, &input, &mut hidden, &mut output)
+                        .unwrap(),
+                    score,
+                    "epoch {epoch}, counter {counter}"
+                );
+            }
+        }
+    }
+}

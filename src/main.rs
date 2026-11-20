@@ -54,7 +54,7 @@ struct Cli {
 
     #[arg(
         long,
-        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet", "contract-devnet"],
+        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet", "contract-devnet", "compute-devnet", "offline-devnet"],
         default_value = "devnet"
     )]
     network: String,
@@ -236,6 +236,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "testnet" => ChainConfig::testnet(),
         "devnet" => ChainConfig::devnet(),
         "neural-devnet" => ChainConfig::neural_devnet(),
+        "compute-devnet" => ChainConfig {
+            network_name: "hyphen-compute-devnet-v1".into(),
+            network_magic: *b"HYAC",
+            consensus_features: hyphen_core::FEATURE_USEFUL_WORK
+                | FEATURE_ASSET_RULES_V1
+                | (1 << 10),
+            ..ChainConfig::devnet()
+        },
+        "offline-devnet" => ChainConfig {
+            network_name: "hyphen-offline-devnet-v1".into(),
+            network_magic: *b"HYOF",
+            consensus_features: FEATURE_ASSET_RULES_V1 | (1 << 11),
+            ..ChainConfig::devnet()
+        },
         "contract-devnet" => ChainConfig {
             network_name: "hyphen-contract-devnet-v1".into(),
             network_magic: *b"HYCD",
@@ -265,12 +279,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         cli.threads
     };
-    if cli.threads == 0 && threads != detected {
-        info!(
-            "Auto thread count: {threads} of {detected} logical cores; pass --threads {detected} to claim all"
-        );
-    }
-
     let sk = if cli.key_file.is_empty() {
         let sk = SecretKey::generate();
         info!("Generated ephemeral miner key: {}", sk.public_key());
@@ -285,24 +293,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SecretKey(bytes)
     };
 
-    info!(
-        "Hyphen Miner starting: pool={}, threads={}, network={}",
-        cli.pool, threads, cfg.network_name
-    );
-
+    let neural = cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK);
     let accelerator = if cli.no_accelerator {
         None
     } else {
         let directory =
             (!cli.accelerator_dir.is_empty()).then(|| PathBuf::from(&cli.accelerator_dir));
-        match Accelerator::load(directory.as_deref()) {
+        match Accelerator::load(directory.as_deref(), neural) {
             Ok(accelerator) => {
                 info!(
                     "Native accelerator: {} on {} via {} ({} candidate window)",
                     accelerator.backend(),
                     accelerator.device_name(),
                     accelerator.path().display(),
-                    accelerator.max_candidates(),
+                    if neural {
+                        accelerator::NEURAL_WINDOW
+                    } else {
+                        accelerator.max_candidates()
+                    },
                 );
                 Some(accelerator)
             }
@@ -313,6 +321,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let threads = if neural && accelerator.is_some() && cli.threads == 0 {
+        1
+    } else {
+        threads
+    };
+    info!(
+        "Hyphen Miner starting: pool={}, threads={}, network={}",
+        cli.pool, threads, cfg.network_name
+    );
     let state = Arc::new(MinerState::with_accelerator(accelerator));
 
     // The pool link is dialled directly, or through the operator's proxy when
@@ -1377,6 +1394,8 @@ fn mine_neural_block(
     let stride = thread_count.max(1) as u64;
     let mut counter = thread_id as u64;
     let mut attempts: u64 = 0;
+    let mut backend = "cpu";
+    let started = std::time::Instant::now();
     loop {
         // `generation` moves whenever the job is replaced, and the outer loop
         // owns the connection check, so this is the whole stop condition. A
@@ -1387,6 +1406,52 @@ fn mine_neural_block(
             || job.candidate_in_flight.load(Ordering::Acquire)
         {
             return Ok(());
+        }
+        if !state.accelerator_failed.load(Ordering::Acquire)
+            && let Some(device) = &state.accelerator
+        {
+            let window = descriptor
+                .expected_attempts()
+                .clamp(128, u64::from(accelerator::NEURAL_WINDOW)) as u32;
+            let checked = device
+                .neural_scores(&descriptor, &weights, counter, stride, window)
+                .and_then(|scores| {
+                    let Some(index) = scores
+                        .iter()
+                        .position(|score| *score < descriptor.threshold)
+                    else {
+                        return Ok(false);
+                    };
+                    let winner = counter.wrapping_add((index as u64).wrapping_mul(stride));
+                    descriptor
+                        .candidate(winner, &mut solution)
+                        .map_err(|error| error.to_string())?;
+                    let verified_score = descriptor
+                        .score(&weights, &solution, &mut hidden, &mut output)
+                        .map_err(|error| error.to_string())?;
+                    if verified_score != scores[index] {
+                        return Err("winning score differs from Rust".into());
+                    }
+                    Ok(true)
+                });
+            match checked {
+                Ok(found) => {
+                    attempts = attempts.saturating_add(u64::from(window));
+                    state
+                        .total_operations
+                        .fetch_add(u64::from(window), Ordering::Relaxed);
+                    if found {
+                        backend = device.backend();
+                        break;
+                    }
+                    counter = counter.wrapping_add(u64::from(window).wrapping_mul(stride));
+                    continue;
+                }
+                Err(error) => {
+                    state.accelerator_failed.store(true, Ordering::Release);
+                    warn!("Neural accelerator disabled, retrying window on CPU: {error}");
+                }
+            }
         }
         let outcome = hyphen_neural::search_work(
             &descriptor,
@@ -1441,8 +1506,9 @@ fn mine_neural_block(
         return Ok(());
     }
     info!(
-        "Thread {thread_id}: neural solution at height {} after {attempts} attempts",
-        job.header.height
+        "Thread {thread_id}: neural solution at height {} after {attempts} scores (backend={backend}, search_us={})",
+        job.header.height,
+        started.elapsed().as_micros()
     );
     tx.blocking_send(Ok(ShareCandidate {
         job_id: job.job_id,
@@ -1478,7 +1544,7 @@ fn run_accelerator_check(
     if !(hyphen_pow::MIN_CHAIN_LENGTH..=hyphen_pow::MAX_CHAIN_LENGTH).contains(&length) {
         return Err("chain length is outside the consensus range".into());
     }
-    let accelerator = Accelerator::load(accelerator_dir)?;
+    let accelerator = Accelerator::load(accelerator_dir, false)?;
     let requested = batch.clamp(1, 1 << 24);
     offset
         .checked_add(stride.saturating_mul(requested as u64 - 1))
@@ -1490,8 +1556,12 @@ fn run_accelerator_check(
     let started = std::time::Instant::now();
     let outcome = accelerator.scan(offset, stride, requested, length, requested)?;
     let elapsed = started.elapsed();
-    let scanned = outcome.scanned.max(1);
+    let scanned = outcome.scanned;
+    if outcome.truncated || scanned != requested {
+        return Err("accelerator returned an incomplete comparison window".into());
+    }
 
+    let cpu_started = std::time::Instant::now();
     let mut cpu = Vec::new();
     for index in 0..scanned as u64 {
         let candidate = offset + index * stride;
@@ -1500,6 +1570,7 @@ fn run_accelerator_check(
         }
     }
 
+    let cpu_elapsed = cpu_started.elapsed();
     let mut gpu = Vec::with_capacity(outcome.survivors.len());
     for candidate in &outcome.survivors {
         let relative = candidate.checked_sub(offset).ok_or_else(|| {
@@ -1517,7 +1588,7 @@ fn run_accelerator_check(
     gpu.sort_unstable();
     cpu.sort_unstable();
 
-    if !outcome.truncated && gpu != cpu {
+    if gpu != cpu {
         let first = gpu
             .iter()
             .zip(&cpu)
@@ -1548,9 +1619,7 @@ fn run_accelerator_check(
         outcome.device_time_ns as f64 / 1e6
     );
     println!("wall time:    {:.3} ms", elapsed.as_secs_f64() * 1e3);
-    if outcome.truncated {
-        println!("note: survivor buffer was truncated; exact CPU comparison skipped");
-    }
+    println!("CPU sieve:    {:.3} ms", cpu_elapsed.as_secs_f64() * 1e3);
     Ok(())
 }
 

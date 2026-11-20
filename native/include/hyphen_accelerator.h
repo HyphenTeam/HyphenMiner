@@ -17,6 +17,8 @@ extern "C" {
 #define HYPHEN_ACCELERATOR_ABI_VERSION 2u
 #define HYPHEN_KERNEL_DIFFUSION_2D_Q12_V1 2u
 #define HYPHEN_KERNEL_CUNNINGHAM_SIEVE_V1 3u
+#define HYPHEN_KERNEL_NEURAL_WORK_V1 4u
+#define HYPHEN_CAP_NEURAL_WORK_V1 (UINT64_C(1) << 3)
 #define HYPHEN_CAP_DIFFUSION_2D_Q12_V1 (UINT64_C(1) << 1)
 #define HYPHEN_CAP_CUNNINGHAM_SIEVE_V1 (UINT64_C(1) << 2)
 #define HYPHEN_POUW_GRID_SIDE 64u
@@ -86,6 +88,17 @@ typedef struct HyphenCunninghamSieveHeaderV1 {
   uint64_t survivor_count;
   uint64_t truncated;
 } HyphenCunninghamSieveHeaderV1;
+
+// Kernel 4 scores the 16/64/16 WorkDescriptor profile. The output contains
+// one native uint64_t per counter in request order, with wrapping arithmetic.
+typedef struct HyphenNeuralWorkRequestV1 {
+  uint64_t start;
+  uint64_t stride;
+  uint32_t candidates;
+  uint32_t reserved;
+  uint32_t seed_words[8]; // little-endian words of the public work seed
+  int64_t weights[2128]; // W1, b1, W2, b2 in the consensus Q32.32 layout
+} HyphenNeuralWorkRequestV1;
 
 typedef int32_t (*HyphenEnumerateDevicesV1)(HyphenDeviceInfoV1 *devices,
                                             uint32_t capacity,
