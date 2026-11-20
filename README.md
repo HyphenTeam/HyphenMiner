@@ -1,6 +1,6 @@
 # Hyphen Miner
 
-[简体中文](README_CN.md)
+[简体中文](README_CN.md) · [Miner documentation](https://github.com/HyphenTeam/HyphenMiner/wiki)
 
 Hyphen Miner searches for verifiable work and submits signed shares to a Hyphen pool. The portable CPU backend supports the standard and neural devnets. CUDA and HIP plugins accelerate the Cunningham search. The CUDA plugin also scores neural work on `neural-devnet`, with Rust verification of each winning score.
 
