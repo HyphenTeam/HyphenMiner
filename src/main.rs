@@ -209,8 +209,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     if let Some(Commands::Keygen { output }) = &cli.command {
+        use std::io::Write;
+        let parent = std::path::Path::new(output)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
         let sk = SecretKey::generate();
-        std::fs::write(output, sk.0)?;
+        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+        staged.write_all(&sk.0)?;
+        staged.as_file().sync_all()?;
+        staged.persist_noclobber(output)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
         println!("Key generated successfully:");
         println!("  Secret key file : {output}");
         println!("  Public key (hex): {}", sk.public_key());
@@ -284,13 +294,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Generated ephemeral miner key: {}", sk.public_key());
         sk
     } else {
-        let data = std::fs::read(&cli.key_file)?;
-        if data.len() != 32 {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&cli.key_file)?;
+        let mut key = SecretKey([0; 32]);
+        file.read_exact(&mut key.0)?;
+        if file.read(&mut [0])? != 0 {
             return Err("key file must be exactly 32 bytes".into());
         }
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&data);
-        SecretKey(bytes)
+        key
     };
 
     let neural = cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK);
@@ -544,21 +555,21 @@ async fn connect_and_mine(
 
     let conn_gen = state.connection_generation.load(Ordering::Acquire);
 
-    let cfg_clone = cfg.clone();
-    let state_clone = Arc::clone(state);
-    let submit_tx = start_mining_threads(
+    let session = MiningSession(state);
+    let (mut share_rx, workers) = start_mining_threads(
         threads,
-        state_clone,
+        Arc::clone(state),
         MiningLaunchConfig {
-            chain: cfg_clone.clone(),
+            chain: cfg.clone(),
             batch_size: cli_batch_size,
             connection_generation: conn_gen,
             miner_secret: sk.clone(),
         },
-    );
+    )?;
 
+    let mut reports = tokio::task::JoinSet::new();
     let compute_rate_state = Arc::clone(state);
-    let compute_rate_handle = tokio::spawn(async move {
+    reports.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         let mut last_operations: u64 = 0;
         loop {
@@ -586,7 +597,7 @@ async fn connect_and_mine(
 
     let writer = Arc::clone(&write_half);
     let ka_sk = keepalive_sk.clone();
-    let keepalive_handle = tokio::spawn(async move {
+    reports.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
@@ -607,7 +618,7 @@ async fn connect_and_mine(
     let report_sk = sk.clone();
     let report_state = Arc::clone(state);
     let start_time = std::time::Instant::now();
-    let compute_rate_report_handle = tokio::spawn(async move {
+    reports.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         let mut last_operations: u64 = 0;
         loop {
@@ -637,8 +648,6 @@ async fn connect_and_mine(
             }
         }
     });
-
-    let mut share_rx = submit_tx;
 
     let loop_result: Result<(), Box<dyn std::error::Error>> = async {
         loop {
@@ -802,13 +811,32 @@ async fn connect_and_mine(
     }
     .await;
 
-    // Abort background tasks so they don't leak on reconnect
-    compute_rate_handle.abort();
-    keepalive_handle.abort();
-    compute_rate_report_handle.abort();
-    state.replace_job(None);
-
+    drop(session);
+    drop(share_rx);
+    reports.shutdown().await;
+    tokio::task::spawn_blocking(move || {
+        let mut panicked = false;
+        for worker in workers {
+            panicked |= worker.join().is_err();
+        }
+        if panicked {
+            Err("mining worker panicked")
+        } else {
+            Ok(())
+        }
+    })
+    .await??;
     loop_result
+}
+
+struct MiningSession<'a>(&'a MinerState);
+
+impl Drop for MiningSession<'_> {
+    fn drop(&mut self) {
+        self.0.connection_generation.fetch_add(1, Ordering::Release);
+        self.0.replace_job(None);
+        self.0.pending_submission_hashes.write().clear();
+    }
 }
 
 fn handle_new_job(
@@ -1079,11 +1107,13 @@ impl SearchLane {
     }
 }
 
+type ShareReceiver = tokio::sync::mpsc::Receiver<std::io::Result<ShareCandidate>>;
+
 fn start_mining_threads(
     threads: usize,
     state: Arc<MinerState>,
     launch: MiningLaunchConfig,
-) -> tokio::sync::mpsc::Receiver<std::io::Result<ShareCandidate>> {
+) -> std::io::Result<(ShareReceiver, Vec<std::thread::JoinHandle<()>>)> {
     // The network writer handles one frame at a time. Backpressure the search
     // threads when the connection stalls instead of accumulating witness lists.
     let (tx, rx) = tokio::sync::mpsc::channel(2);
@@ -1093,13 +1123,14 @@ fn start_mining_threads(
         lane.start, lane.end
     );
 
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for thread_id in 0..threads {
         let cfg = launch.chain.clone();
         let state = Arc::clone(&state);
         let tx = tx.clone();
         let miner_secret = launch.miner_secret.clone();
 
-        std::thread::spawn(move || {
+        let worker = std::thread::Builder::new().spawn(move || {
             if let Err(error) = mining_thread(
                 MiningThreadConfig {
                     thread_id,
@@ -1116,9 +1147,19 @@ fn start_mining_threads(
                 let _ = tx.blocking_send(Err(error));
             }
         });
+        match worker {
+            Ok(handle) => workers.push(handle),
+            Err(error) => {
+                drop(rx);
+                for handle in workers {
+                    let _ = handle.join();
+                }
+                return Err(error);
+            }
+        }
     }
 
-    rx
+    Ok((rx, workers))
 }
 
 fn mining_thread(
@@ -1151,7 +1192,7 @@ fn mining_thread(
     let mut credit_sent = false;
 
     loop {
-        if !state.running.load(Ordering::Relaxed) {
+        if tx.is_closed() || !state.running.load(Ordering::Relaxed) {
             break;
         }
         if state.connection_generation.load(Ordering::Acquire) != conn_gen {
@@ -1853,6 +1894,48 @@ mod tests {
         pending.complete(&SubmitResult::default());
         assert!(!pending.job.candidate_in_flight.load(Ordering::Acquire));
         assert!(current.candidate_in_flight.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn disconnect_releases_every_worker_before_reconnecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let cfg = ChainConfig::devnet();
+        let identity = ChainIdentity::of(&cfg);
+        let ack = LoginAck {
+            accepted: true,
+            network_name: cfg.network_name.to_string(),
+            protocol_version: POOL_PROTOCOL_VERSION,
+            network_magic: cfg.network_magic.to_vec(),
+            consensus_params_hash: identity.consensus_params_hash.to_vec(),
+            genesis_hash: identity.genesis_hash.to_vec(),
+            ..Default::default()
+        };
+        let state = Arc::new(MinerState::new());
+        let pool_key = SecretKey::generate();
+        let miner_key = SecretKey::generate();
+        for _ in 0..64 {
+            let pool = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let login = PoolCodec::read_envelope(&mut stream).await.unwrap();
+                assert_eq!(login.msg_type, MSG_LOGIN);
+                let envelope = PoolEnvelope::sign(MSG_LOGIN_ACK, ack.encode_to_vec(), &pool_key);
+                PoolCodec::write_envelope(&mut stream, &envelope)
+                    .await
+                    .unwrap();
+                let report = PoolCodec::read_envelope(&mut stream).await.unwrap();
+                assert!(matches!(
+                    report.msg_type,
+                    MSG_KEEPALIVE | MSG_COMPUTE_RATE_REPORT
+                ));
+            };
+            let client = connect_and_mine(
+                &endpoint, None, &miner_key, "test", &cfg, 2, &state, 1000, &[1; 64], false,
+            );
+            let ((), result) = tokio::join!(pool, client);
+            assert!(result.is_err());
+            assert_eq!(Arc::strong_count(&state), 1);
+        }
     }
 
     #[test]

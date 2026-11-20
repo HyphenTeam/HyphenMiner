@@ -96,6 +96,17 @@ struct NeuralWorkRequestV1 {
 type EnumerateDevices = unsafe extern "C" fn(*mut DeviceInfoV1, u32, *mut u32) -> i32;
 type Execute = unsafe extern "C" fn(*const ExecuteRequestV1, *mut ExecuteResultV1) -> i32;
 type FreeResult = unsafe extern "C" fn(*mut u8, usize);
+
+struct PluginBuffer<'a> {
+    result: &'a ExecuteResultV1,
+    free: FreeResult,
+}
+
+impl Drop for PluginBuffer<'_> {
+    fn drop(&mut self) {
+        unsafe { (self.free)(self.result.output, self.result.output_len) };
+    }
+}
 type GetLastError = unsafe extern "C" fn(*mut u8, usize) -> usize;
 type GetApi = unsafe extern "C" fn(u32, *mut *const BackendApiV1) -> i32;
 
@@ -150,16 +161,6 @@ impl Accelerator {
                 directories.push(parent.join("accelerators").join("Release"));
                 directories.push(parent.to_path_buf());
             }
-            if let Ok(current) = std::env::current_dir() {
-                directories.push(current.join("accelerators"));
-                directories.push(current.join("accelerators").join("Release"));
-            }
-            directories.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("accelerators"));
-            directories.push(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("accelerators")
-                    .join("Release"),
-            );
         }
 
         let extension = std::env::consts::DLL_EXTENSION;
@@ -185,6 +186,22 @@ impl Accelerator {
     }
 
     fn load_file(path: &Path, capability: u64) -> Result<Self, String> {
+        #[cfg(windows)]
+        let library: libloading::Library = {
+            use libloading::os::windows::{
+                LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, Library,
+            };
+            let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
+            unsafe {
+                Library::load_with_flags(
+                    absolute,
+                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+                )
+            }
+            .map_err(|e| format!("cannot load {}: {e}", path.display()))?
+            .into()
+        };
+        #[cfg(not(windows))]
         let library = unsafe { libloading::Library::new(path) }
             .map_err(|error| format!("cannot load {}: {error}", path.display()))?;
         let get_api: libloading::Symbol<'_, GetApi> = unsafe {
@@ -200,12 +217,14 @@ impl Accelerator {
                 "plugin rejected ABI {ACCELERATOR_ABI_VERSION} with status {status}"
             ));
         }
-        let api = unsafe { *raw_api };
-        if api.abi_version != ACCELERATOR_ABI_VERSION
-            || (api.struct_size as usize) < std::mem::size_of::<BackendApiV1>()
+        // Only the two header words are available until the table size is checked.
+        let header = unsafe { raw_api.cast::<[u32; 2]>().read_unaligned() };
+        if header[0] != ACCELERATOR_ABI_VERSION
+            || (header[1] as usize) < std::mem::size_of::<BackendApiV1>()
         {
             return Err("plugin reported an incompatible ABI".into());
         }
+        let api = unsafe { raw_api.read_unaligned() };
         let enumerate = api
             .enumerate_devices
             .ok_or_else(|| "plugin has no enumerate_devices entry point".to_string())?;
@@ -222,10 +241,16 @@ impl Accelerator {
             return Err("plugin reports no devices".into());
         }
 
+        if count > 1024 {
+            return Err("plugin device count exceeds 1024".into());
+        }
         let mut devices = vec![DeviceInfoV1::default(); count as usize];
         let status = unsafe { enumerate(devices.as_mut_ptr(), count, &mut count) };
         if status != 0 {
             return Err(format!("device enumeration failed with status {status}"));
+        }
+        if count as usize > devices.len() {
+            return Err("plugin device list grew during enumeration".into());
         }
         devices.truncate(count as usize);
 
@@ -393,15 +418,21 @@ impl Accelerator {
             device_time_ns: 0,
         };
         let execute = self.api.execute.ok_or("missing execute entry point")?;
+        let free = self
+            .api
+            .free_result
+            .ok_or("missing free_result entry point")?;
         if unsafe { execute(&request, &mut result) } != 0 {
             return Err(self.last_error());
         }
         if result.output.is_null() {
             return Err("accelerator returned no output".into());
         }
-        let parsed = parse(&result);
-        self.free(result.output, result.output_len);
-        parsed
+        let buffer = PluginBuffer {
+            result: &result,
+            free,
+        };
+        parse(buffer.result)
     }
 
     unsafe fn parse_result(
@@ -413,7 +444,10 @@ impl Accelerator {
         // The caller checked the plugin buffer contains HEADER_BYTES and keeps it alive until return.
         let header =
             unsafe { ptr::read_unaligned(result.output.cast::<CunninghamSieveHeaderV1>()) };
-        let count = header.survivor_count.min(max_survivors as u64) as usize;
+        if header.survivor_count > u64::from(max_survivors) {
+            return Err("accelerator returned too many survivors".into());
+        }
+        let count = header.survivor_count as usize;
         let required = HEADER_BYTES
             .checked_add(count.saturating_mul(std::mem::size_of::<u64>()))
             .ok_or_else(|| "accelerator result length overflow".to_string())?;
@@ -447,12 +481,6 @@ impl Accelerator {
             return "accelerator call failed".into();
         }
         String::from_utf8_lossy(&buffer[..length]).into_owned()
-    }
-
-    fn free(&self, output: *mut u8, output_len: usize) {
-        if let Some(free_result) = self.api.free_result {
-            unsafe { free_result(output, output_len) };
-        }
     }
 }
 
