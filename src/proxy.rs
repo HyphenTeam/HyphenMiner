@@ -158,7 +158,7 @@ impl ProxySpec {
             other => {
                 return Err(invalid(&format!(
                     "unsupported proxy scheme '{other}'; use socks5:// or http://"
-                )))
+                )));
             }
         };
 
@@ -349,7 +349,7 @@ fn negotiate_socks5(stream: &mut TcpStream, spec: &ProxySpec, pool: &str) -> Han
                         "it requires username/password authentication; put credentials in \
                          --via-proxy (socks5://user:pass@host:port)"
                             .to_string(),
-                    ))
+                    ));
                 }
             };
             if user.len() > 255 || pass.len() > 255 {
@@ -375,12 +375,12 @@ fn negotiate_socks5(stream: &mut TcpStream, spec: &ProxySpec, pool: &str) -> Han
         SOCKS5_METHOD_NONE_ACCEPTABLE => {
             return Err(HandshakeFailure::Refused(
                 "it accepts neither no-auth nor username/password".to_string(),
-            ))
+            ));
         }
         other => {
             return Err(HandshakeFailure::Protocol(format!(
                 "it selected unsupported method 0x{other:02x}"
-            )))
+            )));
         }
     }
 
@@ -407,7 +407,7 @@ fn negotiate_socks5(stream: &mut TcpStream, spec: &ProxySpec, pool: &str) -> Han
         other => {
             return Err(HandshakeFailure::Protocol(format!(
                 "it replied with unknown address type 0x{other:02x}"
-            )))
+            )));
         }
     };
     let mut discard = vec![0u8; address_len + 2];

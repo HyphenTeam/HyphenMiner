@@ -134,12 +134,12 @@ impl Accelerator {
         if let Some(directory) = override_directory {
             directories.push(directory);
         } else {
-            if let Ok(executable) = std::env::current_exe() {
-                if let Some(parent) = executable.parent() {
-                    directories.push(parent.join("accelerators"));
-                    directories.push(parent.join("accelerators").join("Release"));
-                    directories.push(parent.to_path_buf());
-                }
+            if let Ok(executable) = std::env::current_exe()
+                && let Some(parent) = executable.parent()
+            {
+                directories.push(parent.join("accelerators"));
+                directories.push(parent.join("accelerators").join("Release"));
+                directories.push(parent.to_path_buf());
             }
             if let Ok(current) = std::env::current_dir() {
                 directories.push(current.join("accelerators"));
@@ -343,7 +343,9 @@ impl Accelerator {
         max_survivors: u32,
         scanned: u32,
     ) -> Result<ScanOutcome, String> {
-        let header = ptr::read_unaligned(result.output.cast::<CunninghamSieveHeaderV1>());
+        // The caller checked the plugin buffer contains HEADER_BYTES and keeps it alive until return.
+        let header =
+            unsafe { ptr::read_unaligned(result.output.cast::<CunninghamSieveHeaderV1>()) };
         let count = header.survivor_count.min(max_survivors as u64) as usize;
         let required = HEADER_BYTES
             .checked_add(count.saturating_mul(std::mem::size_of::<u64>()))
@@ -351,10 +353,13 @@ impl Accelerator {
         if result.output_len < required {
             return Err("accelerator result is shorter than its header claims".into());
         }
-        let values = result.output.add(HEADER_BYTES).cast::<u64>();
         let mut survivors = Vec::with_capacity(count);
         for index in 0..count {
-            survivors.push(ptr::read_unaligned(values.add(index)));
+            // `required` covers the header and every entry through `count`.
+            let value = unsafe {
+                ptr::read_unaligned(result.output.add(HEADER_BYTES).cast::<u64>().add(index))
+            };
+            survivors.push(value);
         }
         Ok(ScanOutcome {
             survivors,

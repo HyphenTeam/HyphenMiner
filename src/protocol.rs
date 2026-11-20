@@ -2,7 +2,7 @@
 use prost::Message;
 use thiserror::Error;
 
-use crate::primitives::{blake3_hash_many, fill_system_random, PublicKey, SecretKey, Signature};
+use crate::primitives::{PublicKey, SecretKey, Signature, blake3_hash_many, fill_system_random};
 
 const SHARE_RECEIPT_DOMAIN: &[u8] = b"Hyphen/NCAP/share-receipt/v1";
 
@@ -345,15 +345,18 @@ pub struct PoolCodec;
 
 impl PoolCodec {
     pub async fn read_envelope(
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
     ) -> Result<PoolEnvelope, PoolError> {
         use tokio::io::AsyncReadExt;
         let len = stream.read_u32().await?;
         if len > 1024 * 1024 {
             return Err(PoolError::Internal(format!("frame too large: {len} bytes")));
         }
-        let mut buf = vec![0u8; len as usize];
-        stream.read_exact(&mut buf).await?;
+        let mut buf = Vec::with_capacity((len as usize).min(8192));
+        stream.take(u64::from(len)).read_to_end(&mut buf).await?;
+        if buf.len() != len as usize {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
         Ok(PoolEnvelope::decode(&buf[..])?)
     }
 
@@ -372,6 +375,26 @@ impl PoolCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn partial_frame_survives_interleaved_outgoing_events() {
+        use tokio::io::AsyncWriteExt;
+        let envelope = PoolEnvelope {
+            msg_type: MSG_KEEPALIVE,
+            payload: vec![3; 19],
+            ..Default::default()
+        };
+        let body = envelope.encode_to_vec();
+        let frame = [(body.len() as u32).to_be_bytes().as_slice(), &body].concat();
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        let mut incoming = std::pin::pin!(PoolCodec::read_envelope(&mut reader));
+        for byte in &frame[..frame.len() - 1] {
+            writer.write_all(&[*byte]).await.unwrap();
+            tokio::select! { biased; _ = &mut incoming => panic!("incomplete frame"), _ = std::future::ready(()) => {} }
+        }
+        writer.write_all(&frame[frame.len() - 1..]).await.unwrap();
+        assert_eq!(incoming.await.unwrap().encode_to_vec(), body);
+    }
 
     #[test]
     fn signed_envelope_handles_max_timestamp_without_overflow() {

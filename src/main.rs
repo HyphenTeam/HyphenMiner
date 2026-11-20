@@ -1,12 +1,13 @@
 mod accelerator;
+mod claims;
 mod primitives;
 mod protocol;
 mod proxy;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use accelerator::Accelerator;
 use clap::{Parser, Subcommand};
@@ -16,10 +17,15 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use primitives::{
-    fill_system_random, hex_encode, wire_config, BlockAuthorization, BlockHeader, ChainConfig,
-    ChainIdentity, Hash256, SecretKey, FROZEN_BLOCK_VERSION,
+    BlockAuthorization, BlockHeader, ChainConfig, ChainIdentity, FROZEN_BLOCK_VERSION, Hash256,
+    SecretKey, fill_system_random, hex_encode, wire_config,
 };
 use protocol::*;
+
+const MAX_UNANSWERED_SHARES: usize = 16;
+const POOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+const FEATURE_ASSET_RULES_V1: u32 = 1 << 9;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,7 +54,7 @@ struct Cli {
 
     #[arg(
         long,
-        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet"],
+        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet", "contract-devnet"],
         default_value = "devnet"
     )]
     network: String,
@@ -109,6 +115,7 @@ enum Commands {
 
 struct MiningJob {
     job_id: [u8; 32],
+    candidate_in_flight: AtomicBool,
     header: BlockHeader,
     chain_length: u32,
     parent_work_commitment: Hash256,
@@ -130,19 +137,13 @@ struct MinerState {
     /// Witnesses this miner has already handed to the pool. The pool enforces
     /// single use chain-wide; locally we only avoid paying for our own
     /// duplicates, which lets a worker keep scanning instead of restarting.
-    submitted_witnesses: RwLock<std::collections::HashSet<u64>>,
+    submitted_witnesses: RwLock<claims::Claims>,
     /// Incremented on each new connection so stale mining threads exit.
     connection_generation: AtomicU64,
     receipt_sequence: AtomicU64,
     receipt_head: RwLock<[u8; 32]>,
     /// Submissions awaiting a pool answer, with the job each belongs to.
-    pending_submission_hashes: RwLock<VecDeque<([u8; 32], [u8; 32])>>,
-    /// Job generation for which a neural solution was already submitted.
-    ///
-    /// Every worker searches the same job concurrently; without this the
-    /// second one to finish burns a full solution on a submission the pool
-    /// classifies as a stale job.
-    neural_solution_generation: AtomicU64,
+    pending_submission_hashes: RwLock<VecDeque<PendingSubmission>>,
     /// Native sieve plugin, when one was found and accepted the ABI.
     accelerator: Option<Accelerator>,
     /// Set after the first device error so every worker falls back to CPU.
@@ -167,26 +168,33 @@ impl MinerState {
             shares_rejected: AtomicU64::new(0),
             blocks_found: AtomicU64::new(0),
             running: AtomicBool::new(true),
-            submitted_witnesses: RwLock::new(std::collections::HashSet::new()),
+            submitted_witnesses: RwLock::default(),
             connection_generation: AtomicU64::new(0),
             receipt_sequence: AtomicU64::new(0),
             receipt_head: RwLock::new([0u8; 32]),
             pending_submission_hashes: RwLock::new(VecDeque::new()),
-            neural_solution_generation: AtomicU64::new(u64::MAX),
             accelerator,
             accelerator_failed: AtomicBool::new(false),
         }
     }
 
-    fn is_locally_claimed(&self, witness: u64) -> bool {
-        self.submitted_witnesses.read().contains(&witness)
+    fn replace_job(&self, job: Option<Arc<MiningJob>>) {
+        let mut current = self.current_job.write();
+        *current = job;
+        self.job_generation.fetch_add(1, Ordering::Release);
     }
 
-    fn mark_submitted(&self, witnesses: &[u64]) {
-        let mut claimed = self.submitted_witnesses.write();
-        for witness in witnesses {
-            claimed.insert(*witness);
-        }
+    fn job_snapshot(&self) -> (Option<Arc<MiningJob>>, u64) {
+        let current = self.current_job.read();
+        (current.clone(), self.job_generation.load(Ordering::Acquire))
+    }
+
+    fn is_locally_claimed(&self, witness: u64) -> std::io::Result<bool> {
+        self.submitted_witnesses.read().contains(witness)
+    }
+
+    fn mark_submitted(&self, witnesses: &[u64]) -> std::io::Result<()> {
+        self.submitted_witnesses.write().insert(witnesses)
     }
 }
 
@@ -228,6 +236,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "testnet" => ChainConfig::testnet(),
         "devnet" => ChainConfig::devnet(),
         "neural-devnet" => ChainConfig::neural_devnet(),
+        "contract-devnet" => ChainConfig {
+            network_name: "hyphen-contract-devnet-v1".into(),
+            network_magic: *b"HYCD",
+            consensus_features: hyphen_core::FEATURE_WASM | FEATURE_ASSET_RULES_V1,
+            ..ChainConfig::devnet()
+        },
         _ => unreachable!("clap validates network"),
     };
 
@@ -247,11 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Leave one core for the node, the pool and the tunnel this miner
         // reports to. A miner that claims every core starves them into
         // timeouts that look like provider faults.
-        if detected > 2 {
-            detected - 1
-        } else {
-            detected
-        }
+        if detected > 2 { detected - 1 } else { detected }
     } else {
         cli.threads
     };
@@ -409,8 +419,7 @@ async fn connect_and_mine(
     // Bump connection generation so stale mining threads from a previous
     // connection will see the change and exit.
     state.connection_generation.fetch_add(1, Ordering::Release);
-    *state.current_job.write() = None;
-    state.job_generation.fetch_add(1, Ordering::Release);
+    state.replace_job(None);
 
     let identity = ChainIdentity::of(cfg);
 
@@ -459,9 +468,11 @@ async fn connect_and_mine(
         genesis_hash: identity.genesis_hash.as_bytes().to_vec(),
     };
     let env = PoolEnvelope::sign(MSG_LOGIN, login.encode_to_vec(), sk);
-    PoolCodec::write_envelope(&mut stream, &env).await?;
-
-    let ack_env = PoolCodec::read_envelope(&mut stream).await?;
+    let ack_env = tokio::time::timeout(POOL_TIMEOUT, async {
+        PoolCodec::write_envelope(&mut stream, &env).await?;
+        PoolCodec::read_envelope(&mut stream).await
+    })
+    .await??;
     ack_env.verify()?;
 
     if ack_env.msg_type != MSG_LOGIN_ACK {
@@ -553,8 +564,7 @@ async fn connect_and_mine(
     });
 
     let keepalive_sk = sk.clone();
-    let (read_half, write_half) = tokio::io::split(stream);
-    let read_half = Arc::new(tokio::sync::Mutex::new(read_half));
+    let (mut read_half, write_half) = stream.into_split();
     let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
 
     let writer = Arc::clone(&write_half);
@@ -614,15 +624,31 @@ async fn connect_and_mine(
     let mut share_rx = submit_tx;
 
     let loop_result: Result<(), Box<dyn std::error::Error>> = async {
-        let read_timeout = std::time::Duration::from_secs(90);
         loop {
+            // Outgoing shares may arrive between any two bytes of a pool frame.
+            let mut incoming = std::pin::pin!(tokio::time::timeout(
+                POOL_TIMEOUT, PoolCodec::read_envelope(&mut read_half)
+            ));
+            loop {
+            let (unanswered, oldest) = {
+                let pending = state.pending_submission_hashes.read();
+                (pending.len(), pending.front().map(|share| share.sent_at))
+            };
             tokio::select! {
-                result = tokio::time::timeout(read_timeout, read_envelope_from(&read_half)) => {
+                _ = async {
+                    if let Some(sent_at) = oldest {
+                        tokio::time::sleep_until(sent_at + POOL_TIMEOUT).await;
+                    }
+                }, if oldest.is_some() => return Err("pool share acknowledgement timed out".into()),
+                result = &mut incoming => {
                     let env = match result {
                         Ok(r) => r?,
                         Err(_) => return Err("pool read timeout (90s with no data)".into()),
                     };
                     env.verify()?;
+                    if env.sender_pubkey.as_slice() != pool_pubkey {
+                        return Err("pool signer changed during the session".into());
+                    }
 
                     match env.msg_type {
                         MSG_JOB => {
@@ -638,7 +664,7 @@ async fn connect_and_mine(
                         }
                         MSG_SUBMIT_RESULT => {
                             let result = SubmitResult::decode(&env.payload[..])?;
-                            let (submission_hash, submitted_job) = state
+                            let pending = state
                                 .pending_submission_hashes
                                 .write()
                                 .pop_front()
@@ -649,7 +675,7 @@ async fn connect_and_mine(
                                     state,
                                     &pool_pubkey,
                                     sk.public_key().as_bytes(),
-                                    &submission_hash,
+                                    &pending.payload_hash,
                                 )?;
                                 state.shares_accepted.fetch_add(1, Ordering::Relaxed);
                                 if result.block_found {
@@ -665,21 +691,18 @@ async fn connect_and_mine(
                                 // replaced is the race a multi-threaded miner
                                 // cannot avoid, not a fault: the pool retired
                                 // the job while this submission was in flight.
-                                let superseded = state
-                                    .current_job
-                                    .read()
-                                    .as_ref()
-                                    .map(|job| job.job_id)
-                                    != Some(submitted_job);
+                                let superseded = state.current_job.read().as_ref()
+                                    .is_none_or(|current| !Arc::ptr_eq(current, &pending.job));
                                 if superseded || result.error == POOL_STALE_JOB {
                                     debug!(
                                         "Share for job {} dropped: the pool had already moved on",
-                                        hex_encode(submitted_job)
+                                        hex_encode(pending.job.job_id)
                                     );
                                 } else {
                                     warn!("Share rejected: {}", result.error);
                                 }
                             }
+                            pending.complete(&result);
                         }
                         MSG_BLOCK_FOUND => {
                             let notify = BlockFoundNotify::decode(&env.payload[..])?;
@@ -712,26 +735,23 @@ async fn connect_and_mine(
                         }
                         _ => {}
                     }
+                    break;
                 }
 
-                share = share_rx.recv() => {
-                    if let Some(candidate) = share {
+                share = share_rx.recv(), if unanswered < MAX_UNANSWERED_SHARES => {
+                        let candidate = share.ok_or("mining workers stopped")??;
                         // A candidate for a job the pool has already replaced
                         // only earns a stale-job rejection. Dropping it here
                         // saves a round trip and keeps the log free of a race
                         // the miner cannot win anyway.
-                        let current_job = state
-                            .current_job
-                            .read()
-                            .as_ref()
-                            .map(|job| job.job_id);
-                        if current_job != Some(candidate.job_id) {
+                        let Some(job) = state.current_job.read().clone()
+                            .filter(|job| job.job_id == candidate.job_id) else {
                             continue;
-                        }
+                        };
                         let submission = ShareSubmission {
                             job_id: candidate.job_id.to_vec(),
                             chain_length: candidate.chain_length as u64,
-                            witnesses: candidate.witnesses.clone(),
+                            witnesses: candidate.witnesses,
                             work_commitment: candidate.work_commitment.as_bytes().to_vec(),
                             block_authorization: candidate.block_authorization,
                         };
@@ -739,10 +759,12 @@ async fn connect_and_mine(
                         let submission_hash = *hyphen_crypto::blake3_hash(&submission_payload).as_bytes();
                         {
                             let mut pending = state.pending_submission_hashes.write();
-                            if pending.len() >= 4_096 {
-                                return Err("pool left too many share submissions unanswered".into());
-                            }
-                            pending.push_back((submission_hash, candidate.job_id));
+                            pending.push_back(PendingSubmission {
+                                payload_hash: submission_hash,
+                                job,
+                                sent_at: tokio::time::Instant::now(),
+                                block_candidate: !submission.block_authorization.is_empty(),
+                            });
                         }
                         let env = PoolEnvelope::sign(
                             MSG_SUBMIT,
@@ -750,12 +772,14 @@ async fn connect_and_mine(
                             sk,
                         );
                         let data = env.encode_to_vec();
-                        let mut w = write_half.lock().await;
-                        use tokio::io::AsyncWriteExt;
-                        w.write_u32(data.len() as u32).await?;
-                        w.write_all(&data).await?;
-                    }
+                        tokio::time::timeout(POOL_TIMEOUT, async {
+                            use tokio::io::AsyncWriteExt;
+                            let mut writer = write_half.lock().await;
+                            writer.write_u32(data.len() as u32).await?;
+                            writer.write_all(&data).await
+                        }).await??;
                 }
+            }
             }
         }
     }
@@ -765,23 +789,9 @@ async fn connect_and_mine(
     compute_rate_handle.abort();
     keepalive_handle.abort();
     compute_rate_report_handle.abort();
+    state.replace_job(None);
 
     loop_result
-}
-
-async fn read_envelope_from(
-    reader: &Arc<tokio::sync::Mutex<tokio::io::ReadHalf<TcpStream>>>,
-) -> Result<PoolEnvelope, PoolError> {
-    use tokio::io::AsyncReadExt;
-    let mut r = reader.lock().await;
-    let len = r.read_u32().await?;
-    if len > 1024 * 1024 {
-        return Err(PoolError::Internal(format!("frame too large: {len} bytes")));
-    }
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf).await?;
-    let envelope = PoolEnvelope::decode(&buf[..])?;
-    Ok(envelope)
 }
 
 fn handle_new_job(
@@ -842,12 +852,6 @@ fn handle_new_job(
         return Err("pool sent a job for an incompatible chain identity".into());
     }
 
-    if template.epoch_seed.len() != 32 {
-        return Err("epoch seed must be exactly 32 bytes".into());
-    }
-    if template.share_difficulty == 0 || template.block_difficulty == 0 {
-        return Err("job difficulty must be greater than zero".into());
-    }
     if template.reward_view_public.len() != 32 || template.reward_spend_public.len() != 32 {
         return Err("job reward keys must both be exactly 32 bytes".into());
     }
@@ -860,6 +864,17 @@ fn handle_new_job(
     reward_spend_public.copy_from_slice(&template.reward_spend_public);
     if reward_view_public == [0u8; 32] || reward_spend_public == [0u8; 32] {
         return Err("pool supplied a zero reward key".into());
+    }
+    if cfg.feature_enabled(FEATURE_ASSET_RULES_V1)
+        && header.extra_nonce
+            != *hyphen_crypto::blake3_hash_many(&[
+                b"Hyphen/reward-recipient/v1",
+                &reward_view_public,
+                &reward_spend_public,
+            ])
+            .as_bytes()
+    {
+        return Err("job header does not commit to the advertised payout keys".into());
     }
     if !allow_shared_reward_recipient
         && (reward_view_public != payout_keys[..32] || reward_spend_public != payout_keys[32..64])
@@ -895,6 +910,7 @@ fn handle_new_job(
 
     let job = Arc::new(MiningJob {
         job_id,
+        candidate_in_flight: AtomicBool::new(false),
         header,
         chain_length: cfg.pouw_chain_length,
         parent_work_commitment: Hash256::from_bytes(parent_work_commitment),
@@ -936,8 +952,7 @@ fn handle_new_job(
     );
 
     if replace {
-        *state.current_job.write() = Some(job.clone());
-        state.job_generation.fetch_add(1, Ordering::Release);
+        state.replace_job(Some(job));
     }
 
     Ok(())
@@ -947,6 +962,21 @@ fn handle_new_job(
 /// arrived. Mirrors the pool's own rejection text; a share rejected for any
 /// other reason is a real fault and stays at WARN.
 const POOL_STALE_JOB: &str = "stale job";
+
+struct PendingSubmission {
+    payload_hash: [u8; 32],
+    sent_at: tokio::time::Instant,
+    job: Arc<MiningJob>,
+    block_candidate: bool,
+}
+
+impl PendingSubmission {
+    fn complete(&self, result: &SubmitResult) {
+        if self.block_candidate && !(result.accepted && result.block_found) {
+            self.job.candidate_in_flight.store(false, Ordering::Release);
+        }
+    }
+}
 
 struct ShareCandidate {
     job_id: [u8; 32],
@@ -1036,8 +1066,10 @@ fn start_mining_threads(
     threads: usize,
     state: Arc<MinerState>,
     launch: MiningLaunchConfig,
-) -> tokio::sync::mpsc::UnboundedReceiver<ShareCandidate> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+) -> tokio::sync::mpsc::Receiver<std::io::Result<ShareCandidate>> {
+    // The network writer handles one frame at a time. Backpressure the search
+    // threads when the connection stalls instead of accumulating witness lists.
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
     let lane = SearchLane::draw(launch.chain.pouw_chain_length);
     info!(
         "Search lane {}..{} is private to this miner instance",
@@ -1051,7 +1083,7 @@ fn start_mining_threads(
         let miner_secret = launch.miner_secret.clone();
 
         std::thread::spawn(move || {
-            mining_thread(
+            if let Err(error) = mining_thread(
                 MiningThreadConfig {
                     thread_id,
                     thread_count: threads,
@@ -1062,8 +1094,10 @@ fn start_mining_threads(
                     lane,
                 },
                 state,
-                tx,
-            );
+                &tx,
+            ) {
+                let _ = tx.blocking_send(Err(error));
+            }
         });
     }
 
@@ -1073,8 +1107,8 @@ fn start_mining_threads(
 fn mining_thread(
     config: MiningThreadConfig,
     state: Arc<MinerState>,
-    tx: tokio::sync::mpsc::UnboundedSender<ShareCandidate>,
-) {
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<ShareCandidate>>,
+) -> std::io::Result<()> {
     let MiningThreadConfig {
         thread_id,
         thread_count,
@@ -1115,15 +1149,19 @@ fn mining_thread(
             );
         }
 
-        let job = match state.current_job.read().clone() {
+        let (job, generation) = state.job_snapshot();
+        let job = match job {
             Some(job) => job,
             None => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
         };
-        let generation = state.job_generation.load(Ordering::Acquire);
 
+        if job.candidate_in_flight.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            continue;
+        }
         if cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK) {
             if let Err(error) = mine_neural_block(
                 &cfg,
@@ -1132,18 +1170,10 @@ fn mining_thread(
                 generation,
                 thread_id,
                 thread_count,
-                &tx,
+                tx,
                 &miner_secret,
             ) {
                 error!("Thread {thread_id}: {error}");
-            }
-            // A solution only becomes a block once the pool submits it, so wait
-            // for the next job instead of burning a second solution.
-            while state.running.load(Ordering::Relaxed)
-                && state.connection_generation.load(Ordering::Acquire) == conn_gen
-                && state.job_generation.load(Ordering::Acquire) == generation
-            {
-                std::thread::sleep(std::time::Duration::from_millis(200));
             }
             continue;
         }
@@ -1174,7 +1204,7 @@ fn mining_thread(
                 batch_size,
                 &mut cursor,
                 stride,
-            );
+            )?;
             if credit.job_changed {
                 continue;
             }
@@ -1198,17 +1228,17 @@ fn mining_thread(
                 job.header.height,
                 &credit_list,
             );
-            state.mark_submitted(&credit_list);
+            state.mark_submitted(&credit_list)?;
             credit_sent = true;
             info!("Thread {thread_id}: credit share with {credit_at} witnesses");
             if tx
-                .send(ShareCandidate {
+                .blocking_send(Ok(ShareCandidate {
                     job_id: job.job_id,
                     chain_length: job.chain_length,
                     witnesses: credit_list,
                     work_commitment,
                     block_authorization: Vec::new(),
-                })
+                }))
                 .is_err()
             {
                 break;
@@ -1225,7 +1255,7 @@ fn mining_thread(
                 batch_size,
                 &mut cursor,
                 stride,
-            );
+            )?;
             if rest.job_changed {
                 continue;
             }
@@ -1268,40 +1298,34 @@ fn mining_thread(
             }
         };
 
-        if state.job_generation.load(Ordering::Acquire) != generation {
+        if state.job_generation.load(Ordering::Acquire) != generation
+            || job.candidate_in_flight.swap(true, Ordering::AcqRel)
+        {
             continue;
         }
 
-        state.mark_submitted(&witnesses);
+        state.mark_submitted(&witnesses)?;
         info!(
             "Thread {thread_id}: block candidate height={} witnesses={}",
             job.header.height,
             witnesses.len()
         );
         if tx
-            .send(ShareCandidate {
+            .blocking_send(Ok(ShareCandidate {
                 job_id: job.job_id,
                 chain_length: job.chain_length,
                 witnesses,
                 work_commitment,
                 block_authorization,
-            })
+            }))
             .is_err()
         {
             break;
         }
-
-        // A candidate only becomes a block once the pool submits it, so wait
-        // for the next job instead of burning a second list on this one.
-        while state.running.load(Ordering::Relaxed)
-            && state.connection_generation.load(Ordering::Acquire) == conn_gen
-            && state.job_generation.load(Ordering::Acquire) == generation
-        {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
     }
 
     info!("Mining thread {thread_id} stopped");
+    Ok(())
 }
 
 /// Largest batch of candidates searched before the thread re-checks for a new
@@ -1323,7 +1347,7 @@ fn mine_neural_block(
     generation: u64,
     thread_id: usize,
     thread_count: usize,
-    tx: &tokio::sync::mpsc::UnboundedSender<ShareCandidate>,
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<ShareCandidate>>,
     miner_secret: &hyphen_crypto::SecretKey,
 ) -> Result<(), String> {
     let identity = ChainIdentity::of(cfg);
@@ -1360,7 +1384,7 @@ fn mine_neural_block(
         // second solution the pool would reject as a stale job.
         if !state.running.load(Ordering::Relaxed)
             || state.job_generation.load(Ordering::Acquire) != generation
-            || state.neural_solution_generation.load(Ordering::Acquire) == generation
+            || job.candidate_in_flight.load(Ordering::Acquire)
         {
             return Ok(());
         }
@@ -1384,16 +1408,6 @@ fn mine_neural_block(
             break;
         }
         counter = counter.wrapping_add(stride.saturating_mul(NEURAL_WORK_BATCH));
-    }
-
-    // Claim the job before submitting: the first worker to finish wins and the
-    // rest stop at their next loop check.
-    if state
-        .neural_solution_generation
-        .swap(generation, Ordering::AcqRel)
-        == generation
-    {
-        return Ok(());
     }
 
     let witnesses: Vec<u64> = solution.iter().map(|value| *value as u64).collect();
@@ -1421,17 +1435,22 @@ fn mine_neural_block(
         .serialize(&authorization)
         .map_err(|error| format!("cannot serialise the block authorization: {error}"))?;
 
+    if state.job_generation.load(Ordering::Acquire) != generation
+        || job.candidate_in_flight.swap(true, Ordering::AcqRel)
+    {
+        return Ok(());
+    }
     info!(
         "Thread {thread_id}: neural solution at height {} after {attempts} attempts",
         job.header.height
     );
-    tx.send(ShareCandidate {
+    tx.blocking_send(Ok(ShareCandidate {
         job_id: job.job_id,
         chain_length: job.chain_length,
         witnesses,
         work_commitment: commitment,
         block_authorization,
-    })
+    }))
     .map_err(|_| "submission channel closed".to_string())
 }
 
@@ -1545,65 +1564,69 @@ fn search_witnesses(
     batch: u64,
     cursor: &mut u64,
     stride: u64,
-) -> WitnessSearch {
+) -> std::io::Result<WitnessSearch> {
     let mut witnesses: Vec<u64> = Vec::with_capacity(count as usize);
     while (witnesses.len() as u64) < count {
         if state.job_generation.load(Ordering::Acquire) != generation {
-            return WitnessSearch {
+            return Ok(WitnessSearch {
                 witnesses,
                 job_changed: true,
-            };
+            });
         }
 
         let accelerator_ready = *cursor >= hyphen_pow::SMALL_PRIME_SIEVE_LIMIT as u64;
-        if accelerator_ready && !state.accelerator_failed.load(Ordering::Acquire) {
-            if let Some(accelerator) = state.accelerator.as_ref() {
-                let scanned = batch.min(accelerator.max_candidates() as u64).max(1) as u32;
-                let missing = count - witnesses.len() as u64;
-                let max_survivors = missing
-                    .saturating_mul(8)
-                    .saturating_add(1_024)
-                    .clamp(1, scanned as u64) as u32;
-                match accelerator.scan(*cursor, stride, scanned, chain_length, max_survivors) {
-                    Ok(outcome) => {
-                        state
-                            .total_operations
-                            .fetch_add(scanned as u64, Ordering::Relaxed);
-                        let truncated = outcome.truncated;
-                        for candidate in outcome.survivors {
-                            if witnesses.contains(&candidate)
-                                || !hyphen_pow::vms::chain_is_valid_after_sieve(
-                                    candidate,
-                                    chain_length,
-                                )
-                                || state.is_locally_claimed(candidate)
-                            {
-                                continue;
-                            }
-                            witnesses.push(candidate);
-                            if witnesses.len() as u64 == count {
-                                break;
-                            }
+        if accelerator_ready
+            && !state.accelerator_failed.load(Ordering::Acquire)
+            && let Some(accelerator) = state.accelerator.as_ref()
+        {
+            let scanned = batch.min(accelerator.max_candidates() as u64).max(1) as u32;
+            let missing = count - witnesses.len() as u64;
+            let max_survivors = missing
+                .saturating_mul(8)
+                .saturating_add(1_024)
+                .clamp(1, scanned as u64) as u32;
+            match accelerator.scan(*cursor, stride, scanned, chain_length, max_survivors) {
+                Ok(outcome) => {
+                    state
+                        .total_operations
+                        .fetch_add(scanned as u64, Ordering::Relaxed);
+                    let truncated = outcome.truncated;
+                    for candidate in outcome.survivors {
+                        if witnesses.contains(&candidate)
+                            || !hyphen_pow::vms::chain_is_valid_after_sieve(candidate, chain_length)
+                            || state.is_locally_claimed(candidate)?
+                        {
+                            continue;
                         }
-                        *cursor = cursor.wrapping_add(stride.saturating_mul(scanned as u64));
-                        if truncated && (witnesses.len() as u64) < count {
-                            warn!(
-                                target: "hyphen::miner",
-                                "Accelerator survivor window truncated at candidate {}",
-                                *cursor
-                            );
+                        witnesses.push(candidate);
+                        if witnesses.len() as u64 == count {
+                            break;
                         }
-                        continue;
                     }
-                    Err(error) => {
-                        warn!("Native accelerator disabled after device error: {error}");
-                        state.accelerator_failed.store(true, Ordering::Release);
+                    *cursor = cursor.wrapping_add(stride.saturating_mul(scanned as u64));
+                    if truncated && (witnesses.len() as u64) < count {
+                        warn!(
+                            target: "hyphen::miner",
+                            "Accelerator survivor window truncated at candidate {}",
+                            *cursor
+                        );
                     }
+                    continue;
+                }
+                Err(error) => {
+                    warn!("Native accelerator disabled after device error: {error}");
+                    state.accelerator_failed.store(true, Ordering::Release);
                 }
             }
         }
 
-        let is_claimed = |candidate: u64| state.is_locally_claimed(candidate);
+        let read_error = std::cell::Cell::new(None);
+        let is_claimed = |candidate: u64| {
+            state.is_locally_claimed(candidate).unwrap_or_else(|error| {
+                read_error.set(Some(error));
+                true
+            })
+        };
         let params = hyphen_pow::vms::SearchParams {
             length: chain_length,
             offset: *cursor,
@@ -1616,12 +1639,15 @@ fn search_witnesses(
             Ok(outcome) => outcome,
             Err(error) => {
                 error!("witness search rejected: {error}");
-                return WitnessSearch {
+                return Ok(WitnessSearch {
                     witnesses,
                     job_changed: true,
-                };
+                });
             }
         };
+        if let Some(error) = read_error.take() {
+            return Err(error);
+        }
         state
             .total_operations
             .fetch_add(outcome.candidates_tested, Ordering::Relaxed);
@@ -1631,10 +1657,10 @@ fn search_witnesses(
             break;
         }
     }
-    WitnessSearch {
+    Ok(WitnessSearch {
         witnesses,
         job_changed: false,
-    }
+    })
 }
 
 fn compute_tx_root(transactions: &[Vec<u8>]) -> Hash256 {
@@ -1712,6 +1738,52 @@ mod tests {
         let hash = hyphen_crypto::blake3_hash(&payload);
         payload.extend_from_slice(&hash.as_bytes()[..4]);
         format!("hy1{}", hyphen_crypto::base58::encode(&payload))
+    }
+
+    #[test]
+    fn a_worker_finishing_an_old_job_cannot_claim_its_successor() {
+        let state = MinerState::new();
+        let job = |id| {
+            Arc::new(MiningJob {
+                job_id: [id; 32],
+                header: hyphen_core::genesis::build_genesis_block(&ChainConfig::neural_devnet())
+                    .header,
+                candidate_in_flight: AtomicBool::new(false),
+                chain_length: 0,
+                parent_work_commitment: Hash256::ZERO,
+                reward_view_public: [1; 32],
+                reward_spend_public: [2; 32],
+            })
+        };
+        state.replace_job(Some(job(1)));
+        let (old, first) = state.job_snapshot();
+        state.replace_job(Some(job(2)));
+        let (current, second) = state.job_snapshot();
+        assert_ne!(first, second);
+        let old = old.unwrap();
+        old.candidate_in_flight.store(true, Ordering::Release);
+        let current = current.unwrap();
+        assert_eq!(current.job_id, [2; 32]);
+        assert!(!current.candidate_in_flight.load(Ordering::Acquire));
+        current.candidate_in_flight.store(true, Ordering::Release);
+        let mut pending = PendingSubmission {
+            payload_hash: [0; 32],
+            sent_at: tokio::time::Instant::now(),
+            job: old,
+            block_candidate: false,
+        };
+        pending.complete(&SubmitResult::default());
+        assert!(pending.job.candidate_in_flight.load(Ordering::Acquire));
+        pending.block_candidate = true;
+        pending.complete(&SubmitResult {
+            accepted: true,
+            block_found: true,
+            ..Default::default()
+        });
+        assert!(pending.job.candidate_in_flight.load(Ordering::Acquire));
+        pending.complete(&SubmitResult::default());
+        assert!(!pending.job.candidate_in_flight.load(Ordering::Acquire));
+        assert!(current.candidate_in_flight.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1927,10 +1999,10 @@ mod tests {
     #[test]
     fn local_claim_set_blocks_self_duplicates() {
         let state = MinerState::new();
-        assert!(!state.is_locally_claimed(3));
-        state.mark_submitted(&[3, 11]);
-        assert!(state.is_locally_claimed(3));
-        assert!(state.is_locally_claimed(11));
-        assert!(!state.is_locally_claimed(5));
+        assert!(!state.is_locally_claimed(3).unwrap());
+        state.mark_submitted(&[3, 11]).unwrap();
+        assert!(state.is_locally_claimed(3).unwrap());
+        assert!(state.is_locally_claimed(11).unwrap());
+        assert!(!state.is_locally_claimed(5).unwrap());
     }
 }
