@@ -2,8 +2,8 @@
 
 HyphenMiner connects CPU and GPU workers to a Hyphen mining pool. The miner signs in with a persistent identity, verifies the network parameters for each job and checks the reward address before submitting a block candidate.
 
-- [Identity and reward address](Operations.md#identity-and-reward-address) covers signing keys, SOLO rewards and authorization for shared payouts.
-- [CPU, plugins and connections](Operations.md#cpu-plugins-and-connections) covers worker limits, CUDA and HIP verification, proxy settings and reconnection.
+- [Identity and reward address](Operations.md#identity-and-reward-address) covers signing keys, SOLO rewards and reward authorization.
+- [CPU, plugins and connections](Operations.md#cpu-plugins-and-connections) covers worker limits, CUDA verification, proxy settings and reconnection.
 
 ## 中文指南
 

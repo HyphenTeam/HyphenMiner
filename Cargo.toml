@@ -4,7 +4,7 @@ version = "0.1.2"
 edition = "2024"
 authors = ["blueokanna", "HyphenTeam"]
 license-file = "LICENSE"
-description = "Hyphen miner: searches single-use Cunningham witness chains for the PoUW v3 chain"
+description = "Hyphen miner: searches nonce-bound neural block work with a memory-hard gate"
 
 [workspace]
 
@@ -15,10 +15,10 @@ path = "src/main.rs"
 [dependencies]
 redb = "5.0.0"
 tempfile = "3.27.0"
-hyphen-core = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "951ea013f0b61115632f463cea22850cd972df83" }
-hyphen-crypto = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "951ea013f0b61115632f463cea22850cd972df83" }
-hyphen-pow = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "951ea013f0b61115632f463cea22850cd972df83" }
-hyphen-neural = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "951ea013f0b61115632f463cea22850cd972df83" }
+hyphen-core = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "8bb9f0f4c43f1fba8a20bbcb1a0e93b907ccccb7" }
+hyphen-crypto = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "8bb9f0f4c43f1fba8a20bbcb1a0e93b907ccccb7" }
+hyphen-pow = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "8bb9f0f4c43f1fba8a20bbcb1a0e93b907ccccb7" }
+hyphen-neural = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "8bb9f0f4c43f1fba8a20bbcb1a0e93b907ccccb7" }
 
 blake3 = "1.8.7"
 clap = { version = "4.6.8", features = ["derive"] }

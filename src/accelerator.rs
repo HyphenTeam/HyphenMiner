@@ -124,9 +124,7 @@ struct BackendApiV1 {
 
 pub struct ScanOutcome {
     pub survivors: Vec<u64>,
-    pub scanned: u32,
     pub truncated: bool,
-    pub device_time_ns: u64,
 }
 
 pub struct Accelerator {
@@ -329,7 +327,7 @@ impl Accelerator {
                 {
                     return Err("accelerator returned an incomplete sieve result".into());
                 }
-                unsafe { self.parse_result(result, max_survivors, candidates) }
+                unsafe { self.parse_result(result, max_survivors) }
             })?;
         for candidate in &outcome.survivors {
             if *candidate < offset
@@ -439,7 +437,6 @@ impl Accelerator {
         &self,
         result: &ExecuteResultV1,
         max_survivors: u32,
-        scanned: u32,
     ) -> Result<ScanOutcome, String> {
         // The caller checked the plugin buffer contains HEADER_BYTES and keeps it alive until return.
         let header =
@@ -464,9 +461,7 @@ impl Accelerator {
         }
         Ok(ScanOutcome {
             survivors,
-            scanned,
             truncated: header.truncated != 0,
-            device_time_ns: result.device_time_ns,
         })
     }
 

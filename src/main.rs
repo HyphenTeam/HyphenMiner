@@ -54,8 +54,8 @@ struct Cli {
 
     #[arg(
         long,
-        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet", "contract-devnet", "compute-devnet", "offline-devnet"],
-        default_value = "devnet"
+        value_parser = ["neural-devnet", "testnet", "mainnet"],
+        default_value = "neural-devnet"
     )]
     network: String,
 
@@ -96,20 +96,20 @@ enum Commands {
         #[arg(long, default_value = "miner.key")]
         output: String,
     },
-    /// Compare the native Cunningham sieve with the portable CPU sieve
+    /// Compare native HYN3 nonce scores with the Rust reference
     AcceleratorCheck {
-        /// Candidates scanned in one call
-        #[arg(long, default_value = "1000000")]
+        /// Number of consecutive samples in the comparison window
+        #[arg(long, default_value = "1024")]
         batch: u32,
-        /// First candidate (must be odd and above the small-prime bound)
-        #[arg(long, default_value = "4101")]
+        /// First nonce
+        #[arg(long, default_value = "0")]
         offset: u64,
         /// Distance between candidates
-        #[arg(long, default_value = "2")]
+        #[arg(long, default_value = "1")]
         stride: u64,
-        /// Cunningham chain length
-        #[arg(long, default_value = "6")]
-        length: u32,
+        /// Time full CUDA/host and single-thread Rust searches over this same window.
+        #[arg(long)]
+        timings: bool,
     },
 }
 
@@ -232,48 +232,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         batch,
         offset,
         stride,
-        length,
+        timings,
     }) = &cli.command
     {
         let directory =
             (!cli.accelerator_dir.is_empty()).then(|| PathBuf::from(&cli.accelerator_dir));
-        return run_accelerator_check(*batch, *offset, *stride, *length, directory.as_deref())
+        return run_accelerator_check(*batch, *offset, *stride, *timings, directory.as_deref())
             .map_err(Into::into);
     }
 
     let cfg = match cli.network.as_str() {
-        "mainnet" => ChainConfig::mainnet(),
-        "testnet" => ChainConfig::testnet(),
-        "devnet" => ChainConfig::devnet(),
         "neural-devnet" => ChainConfig::neural_devnet(),
-        "compute-devnet" => ChainConfig {
-            network_name: "hyphen-compute-devnet-v1".into(),
-            network_magic: *b"HYAC",
-            consensus_features: hyphen_core::FEATURE_USEFUL_WORK
-                | FEATURE_ASSET_RULES_V1
-                | (1 << 10),
-            ..ChainConfig::devnet()
-        },
-        "offline-devnet" => ChainConfig {
-            network_name: "hyphen-offline-devnet-v1".into(),
-            network_magic: *b"HYOF",
-            consensus_features: FEATURE_ASSET_RULES_V1 | (1 << 11),
-            ..ChainConfig::devnet()
-        },
-        "contract-devnet" => ChainConfig {
-            network_name: "hyphen-contract-devnet-v1".into(),
-            network_magic: *b"HYCD",
-            consensus_features: hyphen_core::FEATURE_WASM | FEATURE_ASSET_RULES_V1,
-            ..ChainConfig::devnet()
-        },
+        "testnet" => ChainConfig::testnet(),
+        "mainnet" => ChainConfig::mainnet(),
         _ => unreachable!("clap validates network"),
     };
-
     if cli.network == "mainnet" && cli.key_file.is_empty() {
         return Err(
             "mainnet mining requires --key-file; ephemeral miner identities are unsafe".into(),
         );
     }
+
     if cli.batch_size == 0 {
         return Err("--batch-size must be greater than zero".into());
     }
@@ -326,7 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(accelerator)
             }
             Err(error) => {
-                info!("Native accelerator unavailable ({error}); using CPU witness search");
+                info!("Native accelerator unavailable ({error}); using CPU nonce search");
                 None
             }
         }
@@ -406,6 +385,9 @@ fn parse_wallet_address(address: &str, cfg: &ChainConfig) -> Result<[u8; 64], St
             "pool protocol v{POOL_PROTOCOL_VERSION} requires --wallet-address with a hy1... address"
         )
     })?;
+    if encoded.len() > 95 {
+        return Err("invalid wallet address length".into());
+    }
     let payload = hyphen_crypto::base58::decode(encoded)
         .map_err(|_| "wallet address contains invalid base58".to_string())?;
     if payload.len() != 69 {
@@ -426,6 +408,12 @@ fn parse_wallet_address(address: &str, cfg: &ChainConfig) -> Result<[u8; 64], St
     if payload[65..69] != hash.as_bytes()[..4] {
         return Err("wallet address checksum mismatch".into());
     }
+    hyphen_crypto::stealth::StealthAddress {
+        view_public: payload[1..33].try_into().unwrap(),
+        spend_public: payload[33..65].try_into().unwrap(),
+    }
+    .recipient_points()
+    .map_err(|error| error.to_string())?;
     payload[1..65]
         .try_into()
         .map_err(|_| "wallet address payload is malformed".to_string())
@@ -569,6 +557,11 @@ async fn connect_and_mine(
 
     let mut reports = tokio::task::JoinSet::new();
     let compute_rate_state = Arc::clone(state);
+    let rate_unit = if cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK) {
+        "neural scores/s"
+    } else {
+        "operations/s"
+    };
     reports.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         let mut last_operations: u64 = 0;
@@ -582,7 +575,7 @@ async fn connect_and_mine(
                 .estimated_compute_rate
                 .store(rate.round() as u64, Ordering::Release);
             info!(
-                "Scientific compute: {:.2} ops/s | Checkpoints: {} accepted, {} rejected | Blocks: {}",
+                "{rate_unit}: {:.2} | Shares: {} accepted, {} rejected | Blocks: {}",
                 rate,
                 compute_rate_state.shares_accepted.load(Ordering::Relaxed),
                 compute_rate_state.shares_rejected.load(Ordering::Relaxed),
@@ -981,9 +974,8 @@ fn handle_new_job(
             .unwrap_or(true)
     };
 
-    let active_share_diff = state.current_share_difficulty.load(Ordering::Acquire);
     info!(
-        "{}: height={}, witnesses={}, chain_length={}, credit_at={}, clean={}",
+        "{}: height={}, block_difficulty={}, clean={}",
         if replace {
             "New job"
         } else {
@@ -991,8 +983,6 @@ fn handle_new_job(
         },
         template.height,
         template.block_difficulty,
-        template.chain_length,
-        active_share_diff,
         template.clean_jobs
     );
 
@@ -1107,6 +1097,33 @@ impl SearchLane {
     }
 }
 
+struct LaneCursor {
+    next: u64,
+    end: u64,
+    stride: u64,
+}
+
+impl LaneCursor {
+    fn new(lane: SearchLane, thread_id: usize, stride: u64) -> Self {
+        Self {
+            next: lane.cursor(thread_id),
+            end: lane.end,
+            stride,
+        }
+    }
+
+    fn available(&self, batch: u64) -> u64 {
+        batch.min(self.end.saturating_sub(self.next).div_ceil(self.stride))
+    }
+
+    fn advance(&mut self, scanned: u64) {
+        self.next = self
+            .next
+            .saturating_add(self.stride.saturating_mul(scanned))
+            .min(self.end);
+    }
+}
+
 type ShareReceiver = tokio::sync::mpsc::Receiver<std::io::Result<ShareCandidate>>;
 
 fn start_mining_threads(
@@ -1183,8 +1200,7 @@ fn mining_thread(
     // `2 * thread_count` partitions the lane exactly once, and the lane itself
     // is private to this process.
     let stride = 2 * thread_count as u64;
-    let mut lane = lane;
-    let mut cursor = lane.cursor(thread_id);
+    let mut cursor = LaneCursor::new(lane, thread_id, stride);
     // Witnesses chained for the job in flight, and whether its credit share
     // has already been handed to the pool.
     let mut accumulated: Vec<u64> = Vec::new();
@@ -1198,9 +1214,9 @@ fn mining_thread(
         if state.connection_generation.load(Ordering::Acquire) != conn_gen {
             break;
         }
-        if cursor >= lane.end {
-            lane = SearchLane::draw(cfg.pouw_chain_length);
-            cursor = lane.cursor(thread_id);
+        if cursor.next >= cursor.end {
+            let lane = SearchLane::draw(cfg.pouw_chain_length);
+            cursor = LaneCursor::new(lane, thread_id, stride);
             info!(
                 "Thread {thread_id}: lane exhausted, moving to {}..{}",
                 lane.start, lane.end
@@ -1261,13 +1277,13 @@ fn mining_thread(
                 need,
                 batch_size,
                 &mut cursor,
-                stride,
             )?;
             if credit.job_changed {
                 continue;
             }
             accumulated.extend(credit.witnesses);
             accumulated.sort_unstable();
+            accumulated.dedup();
         }
 
         // One credit share per job: it has to reach the threshold that is
@@ -1312,13 +1328,13 @@ fn mining_thread(
                 remaining,
                 batch_size,
                 &mut cursor,
-                stride,
             )?;
             if rest.job_changed {
                 continue;
             }
             accumulated.extend(rest.witnesses);
             accumulated.sort_unstable();
+            accumulated.dedup();
         }
         if (accumulated.len() as u64) < required {
             continue;
@@ -1386,17 +1402,9 @@ fn mining_thread(
     Ok(())
 }
 
-/// Largest batch of candidates searched before the thread re-checks for a new
-/// job. One candidate is one forward pass, so this bounds the latency between a
-/// new job arriving and the search noticing.
-const NEURAL_WORK_BATCH: u64 = 32_768;
-
-/// Searches the one-way neural work challenge and submits one solution.
+/// Searches nonce-derived neural inputs and applies the memory gate to finalists.
 ///
-/// The challenge is fully determined by public data — the parent hash, the
-/// height, the miner key and the header's threshold — so the search is a plain
-/// forward-pass loop. Each thread walks its own counter residue class, which
-/// keeps workers disjoint without coordination.
+/// Each thread walks its own counter residue class for the parent, height and miner key.
 #[allow(clippy::too_many_arguments)]
 fn mine_neural_block(
     cfg: &ChainConfig,
@@ -1427,17 +1435,12 @@ fn mine_neural_block(
     descriptor
         .derive_weights(&mut weights)
         .map_err(|error| format!("cannot derive work weights: {error}"))?;
-    let mut solution = vec![0_i64; spec.input_dim as usize];
-    let mut hidden = vec![0_i64; spec.hidden_dim as usize];
-    let mut output = vec![0_i64; spec.output_dim as usize];
-    let mut scratch = vec![0_i64; spec.input_dim as usize];
-
     let stride = thread_count.max(1) as u64;
     let mut counter = thread_id as u64;
     let mut attempts: u64 = 0;
     let mut backend = "cpu";
     let started = std::time::Instant::now();
-    loop {
+    let nonce = loop {
         // `generation` moves whenever the job is replaced, and the outer loop
         // owns the connection check, so this is the whole stop condition. A
         // sibling worker that already solved this job stops us from spending a
@@ -1451,41 +1454,44 @@ fn mine_neural_block(
         if !state.accelerator_failed.load(Ordering::Acquire)
             && let Some(device) = &state.accelerator
         {
-            let window = descriptor
-                .expected_attempts()
-                .clamp(128, u64::from(accelerator::NEURAL_WINDOW)) as u32;
+            let remaining = (u64::MAX - counter) / stride;
+            let window = remaining.saturating_add(1).min(256) as u32;
             let checked = device
                 .neural_scores(&descriptor, &weights, counter, stride, window)
                 .and_then(|scores| {
-                    let Some(index) = scores
-                        .iter()
-                        .position(|score| *score < descriptor.threshold)
-                    else {
-                        return Ok(false);
-                    };
-                    let winner = counter.wrapping_add((index as u64).wrapping_mul(stride));
-                    descriptor
-                        .candidate(winner, &mut solution)
-                        .map_err(|error| error.to_string())?;
-                    let verified_score = descriptor
-                        .score(&weights, &solution, &mut hidden, &mut output)
-                        .map_err(|error| error.to_string())?;
-                    if verified_score != scores[index] {
-                        return Err("winning score differs from Rust".into());
+                    for (index, &score) in scores.iter().enumerate() {
+                        let nonce = counter + index as u64 * stride;
+                        if hyphen_neural::block_work::qualifies(&descriptor, nonce, score)
+                            .map_err(|e| e.to_string())?
+                        {
+                            let checked = hyphen_neural::block_work::nonce_score(
+                                &descriptor,
+                                &weights,
+                                nonce,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            if checked != score {
+                                return Err("winning score differs from Rust".into());
+                            }
+                            return Ok(Some(nonce));
+                        }
                     }
-                    Ok(true)
+                    Ok(None)
                 });
             match checked {
-                Ok(found) => {
+                Ok(winner) => {
                     attempts = attempts.saturating_add(u64::from(window));
                     state
                         .total_operations
                         .fetch_add(u64::from(window), Ordering::Relaxed);
-                    if found {
+                    if let Some(nonce) = winner {
                         backend = device.backend();
-                        break;
+                        break nonce;
                     }
-                    counter = counter.wrapping_add(u64::from(window).wrapping_mul(stride));
+                    if remaining < u64::from(window) {
+                        return Ok(());
+                    }
+                    counter += stride * u64::from(window);
                     continue;
                 }
                 Err(error) => {
@@ -1494,29 +1500,22 @@ fn mine_neural_block(
                 }
             }
         }
-        let outcome = hyphen_neural::search_work(
-            &descriptor,
-            &weights,
-            counter,
-            stride,
-            NEURAL_WORK_BATCH,
-            &mut solution,
-            &mut hidden,
-            &mut output,
-            &mut scratch,
-        )
-        .map_err(|error| format!("work search failed: {error}"))?;
-        attempts = attempts.saturating_add(outcome.attempts);
-        state
-            .total_operations
-            .fetch_add(outcome.attempts, Ordering::Relaxed);
-        if outcome.found {
-            break;
+        let score = hyphen_neural::block_work::nonce_score(&descriptor, &weights, counter)
+            .map_err(|e| e.to_string())?;
+        attempts = attempts.saturating_add(1);
+        state.total_operations.fetch_add(1, Ordering::Relaxed);
+        if hyphen_neural::block_work::qualifies(&descriptor, counter, score)
+            .map_err(|e| e.to_string())?
+        {
+            break counter;
         }
-        counter = counter.wrapping_add(stride.saturating_mul(NEURAL_WORK_BATCH));
-    }
+        let Some(next) = counter.checked_add(stride) else {
+            return Ok(());
+        };
+        counter = next;
+    };
 
-    let witnesses: Vec<u64> = solution.iter().map(|value| *value as u64).collect();
+    let witnesses = vec![nonce];
     let commitment = hyphen_core::neural_work_commitment(
         &parent_hash,
         job.header.height,
@@ -1570,97 +1569,84 @@ fn run_accelerator_check(
     batch: u32,
     offset: u64,
     stride: u64,
-    length: u32,
+    timings: bool,
     accelerator_dir: Option<&std::path::Path>,
 ) -> Result<(), String> {
-    let limit = hyphen_pow::SMALL_PRIME_SIEVE_LIMIT as u64;
-    if offset < limit {
+    if !(1..=accelerator::NEURAL_WINDOW).contains(&batch) {
         return Err(format!(
-            "offset must be at least {limit}; below the sieve bound an element can equal a sieve prime"
+            "batch must be within 1..={}",
+            accelerator::NEURAL_WINDOW
         ));
     }
     if stride == 0 {
         return Err("stride must be non-zero".into());
     }
-    if !(hyphen_pow::MIN_CHAIN_LENGTH..=hyphen_pow::MAX_CHAIN_LENGTH).contains(&length) {
-        return Err("chain length is outside the consensus range".into());
+    if u64::from(batch - 1) > (u64::MAX - offset) / stride {
+        return Err("nonce window overflows u64".into());
     }
-    let accelerator = Accelerator::load(accelerator_dir, false)?;
-    let requested = batch.clamp(1, 1 << 24);
-    offset
-        .checked_add(stride.saturating_mul(requested as u64 - 1))
-        .ok_or_else(|| "candidate window overflows u64".to_string())?;
-    // Warm the CUDA/HIP context so the measured scan is not dominated by
-    // first-call initialization.
-    let warmup = requested.min(1_024);
-    let _ = accelerator.scan(offset, stride, warmup, length, warmup)?;
-    let started = std::time::Instant::now();
-    let outcome = accelerator.scan(offset, stride, requested, length, requested)?;
-    let elapsed = started.elapsed();
-    let scanned = outcome.scanned;
-    if outcome.truncated || scanned != requested {
-        return Err("accelerator returned an incomplete comparison window".into());
-    }
-
-    let cpu_started = std::time::Instant::now();
-    let mut cpu = Vec::new();
-    for index in 0..scanned as u64 {
-        let candidate = offset + index * stride;
-        if hyphen_pow::vms::passes_small_prime_sieve(candidate, length) {
-            cpu.push(candidate);
+    let cfg = ChainConfig::neural_devnet();
+    let genesis = hyphen_core::build_genesis_block(&cfg).hash();
+    let seed = hyphen_core::neural_work_seed(&genesis, 1, &[19; 32]);
+    let work = hyphen_neural::WorkDescriptor {
+        spec: hyphen_neural::PROFILE_SPEC,
+        epoch: 1,
+        threshold: cfg.neural_work_initial_threshold,
+        chain_seed: *seed.as_bytes(),
+    };
+    let mut weights = vec![0; work.spec.weight_count()];
+    work.derive_weights(&mut weights)
+        .map_err(|e| e.to_string())?;
+    let device = Accelerator::load(accelerator_dir, true)?;
+    let device_start = std::time::Instant::now();
+    let scores = device.neural_scores(&work, &weights, offset, stride, batch)?;
+    let device_scoring = device_start.elapsed();
+    let mut device_winners = Vec::new();
+    if timings {
+        for (i, &score) in scores.iter().enumerate() {
+            let nonce = offset + i as u64 * stride;
+            if hyphen_neural::block_work::qualifies(&work, nonce, score)
+                .map_err(|e| e.to_string())?
+            {
+                device_winners.push(nonce);
+            }
         }
     }
-
-    let cpu_elapsed = cpu_started.elapsed();
-    let mut gpu = Vec::with_capacity(outcome.survivors.len());
-    for candidate in &outcome.survivors {
-        let relative = candidate.checked_sub(offset).ok_or_else(|| {
-            format!("accelerator returned {candidate}, below the requested window")
-        })?;
-        if relative % stride != 0 || relative / stride >= scanned as u64 {
+    let device_total = device_start.elapsed();
+    let mut winners = 0;
+    let cpu_start = std::time::Instant::now();
+    for (i, device_score) in scores.into_iter().enumerate() {
+        let nonce = offset + i as u64 * stride;
+        let score = hyphen_neural::block_work::nonce_score(&work, &weights, nonce)
+            .map_err(|e| e.to_string())?;
+        if device_score != score {
             return Err(format!(
-                "accelerator returned {candidate}, outside the requested window"
+                "nonce {nonce}: device score {device_score} differs from Rust score {score}"
             ));
         }
-        if hyphen_pow::vms::chain_element(*candidate, length - 1).is_some() {
-            gpu.push(*candidate);
+        if hyphen_neural::block_work::qualifies(&work, nonce, score).map_err(|e| e.to_string())? {
+            if timings && device_winners.get(winners) != Some(&nonce) {
+                return Err("accelerator and CPU winner lists differ".into());
+            }
+            winners += 1;
         }
     }
-    gpu.sort_unstable();
-    cpu.sort_unstable();
-
-    if gpu != cpu {
-        let first = gpu
-            .iter()
-            .zip(&cpu)
-            .find(|(left, right)| left != right)
-            .map(|(left, right)| format!("GPU has {left}, CPU has {right}"))
-            .unwrap_or_else(|| {
-                format!(
-                    "GPU returned {} survivors, CPU returned {}",
-                    gpu.len(),
-                    cpu.len()
-                )
-            });
-        return Err(format!("accelerator sieve mismatch: {first}"));
+    let cpu_total = cpu_start.elapsed();
+    if timings {
+        if winners != device_winners.len() {
+            return Err("accelerator and CPU winner counts differ".into());
+        }
+        println!(
+            "device_score_ns={} device_host_search_ns={} cpu_search_ns={}",
+            device_scoring.as_nanos(),
+            device_total.as_nanos(),
+            cpu_total.as_nanos()
+        );
     }
-
-    let chains = gpu
-        .iter()
-        .filter(|candidate| hyphen_pow::vms::chain_is_valid(**candidate, length))
-        .count();
-    println!("backend:      {}", accelerator.backend());
-    println!("device:       {}", accelerator.device_name());
-    println!("plugin:       {}", accelerator.path().display());
-    println!("window:       {scanned} candidates from {offset} step {stride}");
-    println!("survivors:    {} GPU, {} CPU", gpu.len(), cpu.len());
-    println!("valid chains: {chains}");
     println!(
-        "device time:  {:.3} ms",
-        outcome.device_time_ns as f64 / 1e6
+        "backend={} device={} seed={seed} offset={offset} stride={stride} scores={batch} accepted={winners}",
+        device.backend(),
+        device.device_name()
     );
-    println!("wall time:    {:.3} ms", elapsed.as_secs_f64() * 1e3);
-    println!("CPU sieve:    {:.3} ms", cpu_elapsed.as_secs_f64() * 1e3);
     Ok(())
 }
 
@@ -1672,8 +1658,7 @@ fn search_witnesses(
     chain_length: u32,
     count: u64,
     batch: u64,
-    cursor: &mut u64,
-    stride: u64,
+    cursor: &mut LaneCursor,
 ) -> std::io::Result<WitnessSearch> {
     let mut witnesses: Vec<u64> = Vec::with_capacity(count as usize);
     while (witnesses.len() as u64) < count {
@@ -1684,23 +1669,33 @@ fn search_witnesses(
             });
         }
 
-        let accelerator_ready = *cursor >= hyphen_pow::SMALL_PRIME_SIEVE_LIMIT as u64;
+        let available = cursor.available(batch);
+        if available == 0 {
+            break;
+        }
+        let accelerator_ready = cursor.next >= hyphen_pow::SMALL_PRIME_SIEVE_LIMIT as u64;
         if accelerator_ready
             && !state.accelerator_failed.load(Ordering::Acquire)
             && let Some(accelerator) = state.accelerator.as_ref()
         {
-            let scanned = batch.min(accelerator.max_candidates() as u64).max(1) as u32;
+            let scanned = available.min(accelerator.max_candidates() as u64) as u32;
             let missing = count - witnesses.len() as u64;
             let max_survivors = missing
                 .saturating_mul(8)
                 .saturating_add(1_024)
                 .clamp(1, scanned as u64) as u32;
-            match accelerator.scan(*cursor, stride, scanned, chain_length, max_survivors) {
-                Ok(outcome) => {
+            match accelerator.scan(
+                cursor.next,
+                cursor.stride,
+                scanned,
+                chain_length,
+                max_survivors,
+            ) {
+                Ok(outcome) if !outcome.truncated => {
                     state
                         .total_operations
                         .fetch_add(scanned as u64, Ordering::Relaxed);
-                    let truncated = outcome.truncated;
+                    let mut consumed = u64::from(scanned);
                     for candidate in outcome.survivors {
                         if witnesses.contains(&candidate)
                             || !hyphen_pow::vms::chain_is_valid_after_sieve(candidate, chain_length)
@@ -1710,18 +1705,19 @@ fn search_witnesses(
                         }
                         witnesses.push(candidate);
                         if witnesses.len() as u64 == count {
+                            consumed = (candidate - cursor.next) / cursor.stride + 1;
                             break;
                         }
                     }
-                    *cursor = cursor.wrapping_add(stride.saturating_mul(scanned as u64));
-                    if truncated && (witnesses.len() as u64) < count {
-                        warn!(
-                            target: "hyphen::miner",
-                            "Accelerator survivor window truncated at candidate {}",
-                            *cursor
-                        );
-                    }
+                    cursor.advance(consumed);
                     continue;
+                }
+                // A truncated device result can omit any survivor. Let the CPU
+                // consume this window from the same starting point.
+                Ok(_) => {
+                    state
+                        .total_operations
+                        .fetch_add(u64::from(scanned), Ordering::Relaxed);
                 }
                 Err(error) => {
                     warn!("Native accelerator disabled after device error: {error}");
@@ -1739,10 +1735,10 @@ fn search_witnesses(
         };
         let params = hyphen_pow::vms::SearchParams {
             length: chain_length,
-            offset: *cursor,
-            stride,
+            offset: cursor.next,
+            stride: cursor.stride,
             count: count - witnesses.len() as u64,
-            max_candidates: batch,
+            max_candidates: available,
             is_claimed: &is_claimed,
         };
         let outcome = match hyphen_pow::vms::search(&params) {
@@ -1762,7 +1758,7 @@ fn search_witnesses(
             .total_operations
             .fetch_add(outcome.candidates_tested, Ordering::Relaxed);
         witnesses.extend(outcome.witnesses);
-        *cursor = cursor.wrapping_add(stride.saturating_mul(outcome.candidates_tested.max(1)));
+        cursor.advance(outcome.candidates_tested);
         if outcome.candidates_tested == 0 {
             break;
         }
@@ -1843,8 +1839,9 @@ mod tests {
             0x02
         };
         let mut payload = vec![version];
-        payload.extend_from_slice(&[11u8; 32]);
-        payload.extend_from_slice(&[12u8; 32]);
+        let (_, _, keys) = hyphen_crypto::stealth::generate_keys();
+        payload.extend_from_slice(&keys.view_public);
+        payload.extend_from_slice(&keys.spend_public);
         let hash = hyphen_crypto::blake3_hash(&payload);
         payload.extend_from_slice(&hash.as_bytes()[..4]);
         format!("hy1{}", hyphen_crypto::base58::encode(&payload))
@@ -1856,8 +1853,10 @@ mod tests {
         let job = |id| {
             Arc::new(MiningJob {
                 job_id: [id; 32],
-                header: hyphen_core::genesis::build_genesis_block(&ChainConfig::neural_devnet())
-                    .header,
+                header: hyphen_core::genesis::build_genesis_block(
+                    &ChainConfig::archived_neural_devnet_v1(),
+                )
+                .header,
                 candidate_in_flight: AtomicBool::new(false),
                 chain_length: 0,
                 parent_work_commitment: Hash256::ZERO,
@@ -1900,7 +1899,7 @@ mod tests {
     async fn disconnect_releases_every_worker_before_reconnecting() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap().to_string();
-        let cfg = ChainConfig::devnet();
+        let cfg = ChainConfig::archived_devnet_v2();
         let identity = ChainIdentity::of(&cfg);
         let ack = LoginAck {
             accepted: true,
@@ -1940,7 +1939,7 @@ mod tests {
 
     #[test]
     fn wallet_address_parser_returns_errors_instead_of_panicking() {
-        let cfg = ChainConfig::devnet();
+        let cfg = ChainConfig::archived_devnet_v2();
         assert!(parse_wallet_address(&address_for(&cfg), &cfg).is_ok());
         assert!(parse_wallet_address("hy1not-base58-0OIl", &cfg).is_err());
         assert!(parse_wallet_address("hy1", &cfg).is_err());
@@ -2033,8 +2032,28 @@ mod tests {
     }
 
     #[test]
+    fn partial_batches_stop_at_the_lane_end_without_wrapping() {
+        let lane = SearchLane {
+            start: u64::MAX - 18,
+            end: u64::MAX,
+        };
+        let mut first = LaneCursor::new(lane, 0, 8);
+        assert_eq!(first.available(100), 3);
+        first.advance(2);
+        assert_eq!(first.next, u64::MAX - 2);
+        assert_eq!(first.available(100), 1);
+        first.advance(1);
+        assert_eq!(first.next, lane.end);
+        assert_eq!(first.available(100), 0);
+        let mut second = LaneCursor::new(lane, 1, 8);
+        assert_eq!(second.available(100), 2);
+        second.advance(2);
+        assert_eq!(second.available(1), 0);
+    }
+
+    #[test]
     fn search_lanes_are_disjoint_odd_and_partitioned_per_thread() {
-        let length = ChainConfig::devnet().pouw_chain_length;
+        let length = ChainConfig::archived_devnet_v2().pouw_chain_length;
         let first = SearchLane::from_slot(0, length);
         let second = SearchLane::from_slot(1, length);
         assert_eq!(first.start % 2, 1, "chain origins must be odd");
@@ -2095,7 +2114,7 @@ mod tests {
 
     #[test]
     fn witness_search_returns_verifiable_single_use_chains() {
-        let cfg = ChainConfig::devnet();
+        let cfg = ChainConfig::archived_devnet_v2();
         let length = cfg.pouw_chain_length;
         let claimed = std::sync::Mutex::new(std::collections::HashSet::new());
         let is_claimed = |candidate: u64| claimed.lock().expect("lock").contains(&candidate);
