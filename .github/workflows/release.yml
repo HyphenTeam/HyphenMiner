@@ -24,7 +24,7 @@ jobs:
         include:
           - { os: ubuntu-24.04, artifact: hyphen-miner-linux-x86_64, executable: hyphen-miner }
           - { os: windows-2022, artifact: hyphen-miner-windows-x86_64, executable: hyphen-miner.exe }
-          - { os: macos-14, artifact: hyphen-miner-macos-aarch64, executable: hyphen-miner }
+          - { os: macos-15, artifact: hyphen-miner-macos-aarch64, executable: hyphen-miner }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
