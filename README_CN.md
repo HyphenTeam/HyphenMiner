@@ -2,7 +2,7 @@
 
 [English](README.md) · [矿工运行指南](https://github.com/HyphenTeam/HyphenMiner/wiki/Operations#中文说明)
 
-Hyphen Miner 在神经开发网上搜索 nonce。CPU 与 CUDA 插件计算同一定点神经评分，主机执行 BLAKE3 scratchpad，并向 SOLO 矿池提交签名候选区块。
+Hyphen Miner 默认使用 CPU 搜索 HYN3 nonce。显式传入 `--accelerator-dir 插件目录` 后，CUDA 会生成任务种子与权重，完成神经评分、BLAKE3 初筛、工作内存填充与访问、最终阈值判断，并计算获胜 nonce 的工作承诺。主机负责签名和矿池通信。
 
 ## 在开发网挖矿
 

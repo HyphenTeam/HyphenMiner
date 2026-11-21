@@ -1,17 +1,17 @@
-//! Runtime loader for the native Cunningham sieve and neural work plugins.
-//! The miner checks candidate witnesses and winning neural scores in Rust.
+//! Runtime loader for native HYN3 work plugins.
+//! HYN3 mining requires a backend implementing the complete nonce search.
 
 use std::path::{Path, PathBuf};
 use std::ptr;
 
 const ACCELERATOR_ABI_VERSION: u32 = 2;
-const KERNEL_CUNNINGHAM_SIEVE: u32 = 3;
-const CAP_CUNNINGHAM_SIEVE: u64 = 1 << 2;
 const KERNEL_NEURAL_WORK: u32 = 4;
 const CAP_NEURAL_WORK: u64 = 1 << 3;
+const KERNEL_NEURAL_SEARCH: u32 = 5;
+const KERNEL_NEURAL_PREPARE: u32 = 6;
+const KERNEL_NEURAL_COMMIT: u32 = 7;
+const CAP_NEURAL_SEARCH: u64 = 1 << 4;
 pub const NEURAL_WINDOW: u32 = 32768;
-const MAX_CANDIDATES_PER_CALL: u32 = 1 << 24;
-const HEADER_BYTES: usize = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -67,23 +67,6 @@ struct ExecuteResultV1 {
 }
 
 #[repr(C)]
-struct CunninghamSieveRequestV1 {
-    offset: u64,
-    stride: u64,
-    candidates: u32,
-    chain_length: u32,
-    max_survivors: u32,
-    reserved: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CunninghamSieveHeaderV1 {
-    survivor_count: u64,
-    truncated: u64,
-}
-
-#[repr(C)]
 struct NeuralWorkRequestV1 {
     start: u64,
     stride: u64,
@@ -91,6 +74,37 @@ struct NeuralWorkRequestV1 {
     reserved: u32,
     seed_words: [u32; 8],
     weights: [i64; 2128],
+}
+
+#[repr(C)]
+struct NeuralSearchRequestV1 {
+    work: NeuralWorkRequestV1,
+    threshold: u64,
+}
+
+#[repr(C)]
+struct NeuralTranscript {
+    height: u64,
+    length: u32,
+    reserved: u32,
+    bytes: [u8; 128],
+}
+
+impl NeuralTranscript {
+    fn new(height: u64, parts: &[&[u8]]) -> Self {
+        let mut transcript = Self {
+            height,
+            length: 0,
+            reserved: 0,
+            bytes: [0; 128],
+        };
+        for part in parts {
+            let start = transcript.length as usize;
+            transcript.bytes[start..start + part.len()].copy_from_slice(part);
+            transcript.length += part.len() as u32;
+        }
+        transcript
+    }
 }
 
 type EnumerateDevices = unsafe extern "C" fn(*mut DeviceInfoV1, u32, *mut u32) -> i32;
@@ -122,11 +136,6 @@ struct BackendApiV1 {
     get_last_error: Option<GetLastError>,
 }
 
-pub struct ScanOutcome {
-    pub survivors: Vec<u64>,
-    pub truncated: bool,
-}
-
 pub struct Accelerator {
     // Declared first: the function pointers below are only valid while the
     // library is loaded.
@@ -139,40 +148,21 @@ pub struct Accelerator {
 }
 
 impl Accelerator {
-    pub fn load(directory: Option<&Path>, neural: bool) -> Result<Self, String> {
-        let capability = if neural {
-            CAP_NEURAL_WORK
-        } else {
-            CAP_CUNNINGHAM_SIEVE
-        };
-        let mut directories = Vec::new();
-        let override_directory = directory
-            .map(Path::to_path_buf)
-            .or_else(|| std::env::var_os("HYPHEN_ACCELERATOR_DIR").map(PathBuf::from));
-        if let Some(directory) = override_directory {
-            directories.push(directory);
-        } else {
-            if let Ok(executable) = std::env::current_exe()
-                && let Some(parent) = executable.parent()
-            {
-                directories.push(parent.join("accelerators"));
-                directories.push(parent.join("accelerators").join("Release"));
-                directories.push(parent.to_path_buf());
-            }
+    pub fn load(directory: &Path, neural: bool) -> Result<Self, String> {
+        if !neural {
+            return Err("full GPU nonce search requires the HYN3 neural-devnet profile".into());
         }
-
+        let capability = CAP_NEURAL_WORK | CAP_NEURAL_SEARCH;
         let extension = std::env::consts::DLL_EXTENSION;
         let mut problems = Vec::new();
-        for directory in directories {
-            for backend in ["cuda", "hip"] {
-                let path = directory.join(format!("hyphen_backend_{backend}.{extension}"));
-                if !path.is_file() {
-                    continue;
-                }
-                match Self::load_file(&path, capability) {
-                    Ok(accelerator) => return Ok(accelerator),
-                    Err(error) => problems.push(format!("{}: {error}", path.display())),
-                }
+        for backend in ["cuda", "hip"] {
+            let path = directory.join(format!("hyphen_backend_{backend}.{extension}"));
+            if !path.is_file() {
+                continue;
+            }
+            match Self::load_file(&path, capability) {
+                Ok(accelerator) => return Ok(accelerator),
+                Err(error) => problems.push(format!("{}: {error}", path.display())),
             }
         }
 
@@ -255,7 +245,7 @@ impl Accelerator {
         let device = devices
             .into_iter()
             .find(|device| {
-                device.capability_mask & capability != 0
+                device.capability_mask & capability == capability
                     && device.hardware_accelerated != 0
                     && (device.struct_size as usize) >= std::mem::size_of::<DeviceInfoV1>()
             })
@@ -289,69 +279,13 @@ impl Accelerator {
         &self.device_name
     }
 
-    pub fn max_candidates(&self) -> u32 {
-        MAX_CANDIDATES_PER_CALL
-    }
-
-    pub fn scan(
-        &self,
-        offset: u64,
-        stride: u64,
-        candidates: u32,
-        chain_length: u32,
-        max_survivors: u32,
-    ) -> Result<ScanOutcome, String> {
-        if stride == 0 {
-            return Err("accelerator stride must be non-zero".into());
-        }
-        let candidates = candidates.clamp(1, MAX_CANDIDATES_PER_CALL);
-        let max_survivors = max_survivors.clamp(1, candidates);
-        let span = (candidates as u64 - 1)
-            .checked_mul(stride)
-            .ok_or_else(|| "accelerator candidate span overflows u64".to_string())?;
-        let window_end = offset
-            .checked_add(span)
-            .ok_or_else(|| "accelerator candidate window overflows u64".to_string())?;
-        let request = CunninghamSieveRequestV1 {
-            offset,
-            stride,
-            candidates,
-            chain_length,
-            max_survivors,
-            reserved: 0,
-        };
-        let mut outcome =
-            self.execute(KERNEL_CUNNINGHAM_SIEVE, chain_length, &request, |result| {
-                if result.output_len < HEADER_BYTES
-                    || result.operation_count != u64::from(candidates)
-                {
-                    return Err("accelerator returned an incomplete sieve result".into());
-                }
-                unsafe { self.parse_result(result, max_survivors) }
-            })?;
-        for candidate in &outcome.survivors {
-            if *candidate < offset
-                || *candidate > window_end
-                || !(*candidate - offset).is_multiple_of(stride)
-            {
-                return Err(format!(
-                    "accelerator returned {candidate}, outside the requested window"
-                ));
-            }
-        }
-        outcome.survivors.sort_unstable();
-        outcome.survivors.dedup();
-        Ok(outcome)
-    }
-
-    pub fn neural_scores(
-        &self,
+    fn neural_request(
         descriptor: &hyphen_neural::WorkDescriptor,
         weights: &[i64],
         start: u64,
         stride: u64,
         candidates: u32,
-    ) -> Result<Vec<u64>, String> {
+    ) -> Result<NeuralWorkRequestV1, String> {
         if descriptor.spec != hyphen_neural::PROFILE_SPEC
             || stride == 0
             || !(1..=NEURAL_WINDOW).contains(&candidates)
@@ -365,7 +299,7 @@ impl Accelerator {
         {
             *word = u32::from_le_bytes(*bytes);
         }
-        let request = NeuralWorkRequestV1 {
+        Ok(NeuralWorkRequestV1 {
             start,
             stride,
             candidates,
@@ -374,7 +308,124 @@ impl Accelerator {
             weights: weights
                 .try_into()
                 .map_err(|_| "invalid neural weight count")?,
+        })
+    }
+
+    pub fn prepare_job(
+        &self,
+        parent: &hyphen_crypto::Hash256,
+        height: u64,
+        miner: &[u8; 32],
+    ) -> Result<([u8; 32], Vec<i64>), String> {
+        let request = NeuralTranscript::new(
+            height,
+            &[
+                hyphen_core::NEURAL_WORK_SEED_DOMAIN,
+                parent.as_bytes(),
+                &height.to_le_bytes(),
+                miner,
+            ],
+        );
+        self.execute(KERNEL_NEURAL_PREPARE, 1, &request, |result| {
+            if result.output_len != 32 + hyphen_neural::PROFILE_SPEC.weight_count() * 8
+                || result.operation_count != 1
+            {
+                return Err("invalid CUDA job descriptor".into());
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(result.output, result.output_len) };
+            let (seed, weights) = bytes.split_at(32);
+            Ok((
+                seed.try_into().unwrap(),
+                weights
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(i64::from_ne_bytes)
+                    .collect(),
+            ))
+        })
+    }
+
+    pub fn work_commitment(
+        &self,
+        parent: &hyphen_crypto::Hash256,
+        height: u64,
+        threshold: u64,
+        miner: &[u8; 32],
+        nonce: u64,
+    ) -> Result<hyphen_crypto::Hash256, String> {
+        let request = NeuralTranscript::new(
+            height,
+            &[
+                hyphen_core::NEURAL_WORK_COMMITMENT_DOMAIN,
+                parent.as_bytes(),
+                &height.to_le_bytes(),
+                &threshold.to_le_bytes(),
+                miner,
+                &nonce.to_le_bytes(),
+            ],
+        );
+        self.execute(KERNEL_NEURAL_COMMIT, 1, &request, |result| {
+            if result.output_len != 32 || result.operation_count != 1 {
+                return Err("invalid CUDA work commitment".into());
+            }
+            let digest = unsafe { std::ptr::read(result.output.cast::<[u8; 32]>()) };
+            Ok(hyphen_crypto::Hash256::from_bytes(digest))
+        })
+    }
+
+    pub fn neural_winners(
+        &self,
+        descriptor: &hyphen_neural::WorkDescriptor,
+        weights: &[i64],
+        start: u64,
+        stride: u64,
+        candidates: u32,
+    ) -> Result<Vec<u32>, String> {
+        let request = NeuralSearchRequestV1 {
+            work: Self::neural_request(descriptor, weights, start, stride, candidates)?,
+            threshold: descriptor.threshold,
         };
+        self.execute(KERNEL_NEURAL_SEARCH, 1, &request, |result| {
+            if result.operation_count != u64::from(candidates)
+                || result.output_len < 4
+                || result.output_len > 4 * (candidates as usize + 1)
+                || !result.output_len.is_multiple_of(4)
+            {
+                return Err("invalid GPU winner list length".into());
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(result.output, result.output_len) };
+            let (header, indices) = bytes.split_at(4);
+            if u32::from_ne_bytes(header.try_into().unwrap()) as usize != indices.len() / 4 {
+                return Err("invalid GPU winner count".into());
+            }
+            let mut winners: Vec<_> = indices
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(u32::from_ne_bytes)
+                .collect();
+            winners.sort_unstable();
+            if winners.last().is_some_and(|&i| i >= candidates)
+                || winners.windows(2).any(|w| w[0] == w[1])
+            {
+                return Err("invalid GPU winner index".into());
+            }
+            Ok(winners)
+        })
+    }
+
+    pub fn neural_scores(
+        &self,
+        descriptor: &hyphen_neural::WorkDescriptor,
+        weights: &[i64],
+        start: u64,
+        stride: u64,
+        candidates: u32,
+    ) -> Result<Vec<u64>, String> {
+        let request = Self::neural_request(descriptor, weights, start, stride, candidates)?;
         self.execute(KERNEL_NEURAL_WORK, 1, &request, |result| {
             if result.operation_count != u64::from(candidates)
                 || result.output_len != candidates as usize * 8
@@ -433,38 +484,6 @@ impl Accelerator {
         parse(buffer.result)
     }
 
-    unsafe fn parse_result(
-        &self,
-        result: &ExecuteResultV1,
-        max_survivors: u32,
-    ) -> Result<ScanOutcome, String> {
-        // The caller checked the plugin buffer contains HEADER_BYTES and keeps it alive until return.
-        let header =
-            unsafe { ptr::read_unaligned(result.output.cast::<CunninghamSieveHeaderV1>()) };
-        if header.survivor_count > u64::from(max_survivors) {
-            return Err("accelerator returned too many survivors".into());
-        }
-        let count = header.survivor_count as usize;
-        let required = HEADER_BYTES
-            .checked_add(count.saturating_mul(std::mem::size_of::<u64>()))
-            .ok_or_else(|| "accelerator result length overflow".to_string())?;
-        if result.output_len < required {
-            return Err("accelerator result is shorter than its header claims".into());
-        }
-        let mut survivors = Vec::with_capacity(count);
-        for index in 0..count {
-            // `required` covers the header and every entry through `count`.
-            let value = unsafe {
-                ptr::read_unaligned(result.output.add(HEADER_BYTES).cast::<u64>().add(index))
-            };
-            survivors.push(value);
-        }
-        Ok(ScanOutcome {
-            survivors,
-            truncated: header.truncated != 0,
-        })
-    }
-
     fn last_error(&self) -> String {
         let Some(get_last_error) = self.api.get_last_error else {
             return "accelerator call failed without an error entry point".into();
@@ -492,9 +511,8 @@ const _: () = {
     assert!(std::mem::size_of::<DeviceInfoV1>() == 376);
     assert!(std::mem::size_of::<ExecuteRequestV1>() == 40);
     assert!(std::mem::size_of::<ExecuteResultV1>() == 40);
-    assert!(std::mem::size_of::<CunninghamSieveHeaderV1>() == 16);
-    assert!(std::mem::size_of::<CunninghamSieveRequestV1>() == 32);
     assert!(size_of::<NeuralWorkRequestV1>() == 17080);
+    assert!(size_of::<NeuralSearchRequestV1>() == 17088);
     assert!(std::mem::size_of::<BackendApiV1>() == 72);
 };
 
@@ -503,9 +521,11 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires a device advertising kernel 4 and its plugin"]
+    #[ignore = "requires an HYN3 CUDA plugin and device"]
     fn native_neural_windows_match_rust() {
-        let device = Accelerator::load(None, true).unwrap();
+        let dir =
+            std::env::var_os("HYPHEN_TEST_ACCELERATOR_DIR").expect("set the test plugin directory");
+        let device = Accelerator::load(Path::new(&dir), true).unwrap();
         for (epoch, start, stride, count) in [
             (0, 0, 1, 1),
             (7, u64::MAX - 17, 11, 8193),
@@ -514,7 +534,7 @@ mod tests {
             let descriptor = hyphen_neural::WorkDescriptor {
                 epoch,
                 spec: hyphen_neural::PROFILE_SPEC,
-                threshold: 1_000_000,
+                threshold: 1 << 60,
                 chain_seed: std::array::from_fn(|i| (i as u8).wrapping_add(epoch as u8)),
             };
             let mut weights = vec![0; descriptor.spec.weight_count()];
@@ -523,10 +543,18 @@ mod tests {
                 .neural_scores(&descriptor, &weights, start, stride, count)
                 .unwrap();
             assert_eq!(scores.len(), count as usize);
+            let winners = device
+                .neural_winners(&descriptor, &weights, start, stride, count)
+                .unwrap();
             let (mut input, mut hidden, mut output) = ([0; 16], [0; 64], [0; 16]);
             for (i, score) in scores.into_iter().enumerate() {
                 let counter = start.wrapping_add((i as u64).wrapping_mul(stride));
                 descriptor.candidate(counter, &mut input).unwrap();
+                assert_eq!(
+                    winners.binary_search(&(i as u32)).is_ok(),
+                    hyphen_neural::block_work::qualifies(&descriptor, counter, score).unwrap(),
+                    "epoch {epoch}, counter {counter}"
+                );
                 assert_eq!(
                     descriptor
                         .score(&weights, &input, &mut hidden, &mut output)
@@ -536,5 +564,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires an HYN3 CUDA plugin and device"]
+    fn native_neural_threshold_is_exclusive() {
+        // Published HYN3 height-one vector, using the complete 64-bit memory score.
+        let dir =
+            std::env::var_os("HYPHEN_TEST_ACCELERATOR_DIR").expect("set the test plugin directory");
+        let device = Accelerator::load(Path::new(&dir), true).unwrap();
+        let cfg = hyphen_core::ChainConfig::neural_devnet();
+        let genesis = hyphen_core::build_genesis_block(&cfg).hash();
+        let seed = hyphen_core::neural_work_seed(&genesis, 1, &[19; 32]);
+        let mut descriptor = hyphen_neural::WorkDescriptor {
+            epoch: 1,
+            spec: hyphen_neural::PROFILE_SPEC,
+            chain_seed: *seed.as_bytes(),
+            threshold: 664_485_265_619_752_970,
+        };
+        let mut weights = vec![0; descriptor.spec.weight_count()];
+        descriptor.derive_weights(&mut weights).unwrap();
+        let (device_seed, device_weights) = device.prepare_job(&genesis, 1, &[19; 32]).unwrap();
+        assert_eq!(device_seed, descriptor.chain_seed);
+        assert_eq!(device_weights, weights);
+        assert_eq!(
+            device
+                .work_commitment(&genesis, 1, 1 << 60, &[19; 32], 125)
+                .unwrap(),
+            hyphen_core::neural_work_commitment(&genesis, 1, 1 << 60, &[19; 32], &[125])
+        );
+        assert!(
+            device
+                .neural_winners(&descriptor, &weights, 125, 1, 1)
+                .unwrap()
+                .is_empty()
+        );
+        descriptor.threshold += 1;
+        assert_eq!(
+            device
+                .neural_winners(&descriptor, &weights, 125, 1, 1)
+                .unwrap(),
+            [0]
+        );
     }
 }

@@ -80,12 +80,12 @@ struct Cli {
     allow_shared_reward_recipient: bool,
 
     /// Disable native accelerator plugins and use the portable CPU search.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, global = true, default_value_t = false)]
     no_accelerator: bool,
 
-    /// Directory containing hyphen_backend_cuda / hyphen_backend_hip plugins.
-    #[arg(long, default_value = "", global = true)]
-    accelerator_dir: String,
+    /// Enable a hardware plugin from this directory. Omit for CPU mining.
+    #[arg(long, global = true, conflicts_with = "no_accelerator")]
+    accelerator_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -96,7 +96,7 @@ enum Commands {
         #[arg(long, default_value = "miner.key")]
         output: String,
     },
-    /// Compare native HYN3 nonce scores with the Rust reference
+    /// Compare native HYN3 scores and complete nonce search with the Rust reference
     AcceleratorCheck {
         /// Number of consecutive samples in the comparison window
         #[arg(long, default_value = "1024")]
@@ -107,7 +107,7 @@ enum Commands {
         /// Distance between candidates
         #[arg(long, default_value = "1")]
         stride: u64,
-        /// Time full CUDA/host and single-thread Rust searches over this same window.
+        /// Time complete GPU and single-thread Rust searches over the same window.
         #[arg(long)]
         timings: bool,
     },
@@ -144,9 +144,9 @@ struct MinerState {
     receipt_head: RwLock<[u8; 32]>,
     /// Submissions awaiting a pool answer, with the job each belongs to.
     pending_submission_hashes: RwLock<VecDeque<PendingSubmission>>,
-    /// Native sieve plugin, when one was found and accepted the ABI.
+    /// Explicitly selected full-search plugin for HYN3.
     accelerator: Option<Accelerator>,
-    /// Set after the first device error so every worker falls back to CPU.
+    /// Records a device failure so an HYN3 mining session terminates on error.
     accelerator_failed: AtomicBool,
 }
 
@@ -235,9 +235,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timings,
     }) = &cli.command
     {
-        let directory =
-            (!cli.accelerator_dir.is_empty()).then(|| PathBuf::from(&cli.accelerator_dir));
-        return run_accelerator_check(*batch, *offset, *stride, *timings, directory.as_deref())
+        let directory = cli
+            .accelerator_dir
+            .as_deref()
+            .ok_or("accelerator-check requires --accelerator-dir DIRECTORY")?;
+        return run_accelerator_check(*batch, *offset, *stride, *timings, directory)
             .map_err(Into::into);
     }
 
@@ -284,34 +286,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let neural = cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK);
-    let accelerator = if cli.no_accelerator {
-        None
+    let accelerator = cli
+        .accelerator_dir
+        .as_deref()
+        .map(|dir| Accelerator::load(dir, neural))
+        .transpose()?;
+    if let Some(device) = &accelerator {
+        info!(
+            "Native accelerator: {} on {} via {}",
+            device.backend(),
+            device.device_name(),
+            device.path().display()
+        );
     } else {
-        let directory =
-            (!cli.accelerator_dir.is_empty()).then(|| PathBuf::from(&cli.accelerator_dir));
-        match Accelerator::load(directory.as_deref(), neural) {
-            Ok(accelerator) => {
-                info!(
-                    "Native accelerator: {} on {} via {} ({} candidate window)",
-                    accelerator.backend(),
-                    accelerator.device_name(),
-                    accelerator.path().display(),
-                    if neural {
-                        accelerator::NEURAL_WINDOW
-                    } else {
-                        accelerator.max_candidates()
-                    },
-                );
-                Some(accelerator)
-            }
-            Err(error) => {
-                info!("Native accelerator unavailable ({error}); using CPU nonce search");
-                None
-            }
-        }
-    };
-
-    let threads = if neural && accelerator.is_some() && cli.threads == 0 {
+        info!("CPU nonce search");
+    }
+    let threads = if neural && accelerator.is_some() {
+        info!("GPU nonce search: neural score and BLAKE3 scratchpad on device");
         1
     } else {
         threads
@@ -361,6 +352,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             Ok(()) => break,
             Err(e) => {
+                if neural && state.accelerator_failed.load(Ordering::Acquire) {
+                    return Err(e);
+                }
                 error!("Connection lost: {e}");
                 // Reset backoff if we were connected for a while
                 if conn_start.elapsed().as_secs() > 60 {
@@ -1244,9 +1238,13 @@ fn mining_thread(
                 generation,
                 thread_id,
                 thread_count,
+                batch_size,
                 tx,
                 &miner_secret,
             ) {
+                if state.accelerator_failed.load(Ordering::Acquire) {
+                    return Err(std::io::Error::other(error));
+                }
                 error!("Thread {thread_id}: {error}");
             }
             continue;
@@ -1413,6 +1411,7 @@ fn mine_neural_block(
     generation: u64,
     thread_id: usize,
     thread_count: usize,
+    batch_size: u64,
     tx: &tokio::sync::mpsc::Sender<std::io::Result<ShareCandidate>>,
     miner_secret: &hyphen_crypto::SecretKey,
 ) -> Result<(), String> {
@@ -1420,21 +1419,36 @@ fn mine_neural_block(
     let spec = hyphen_neural::PROFILE_SPEC;
     let miner_pubkey = *miner_secret.public_key().as_bytes();
     let parent_hash = job.header.prev_hash;
-    let seed = hyphen_core::neural_work_seed(&parent_hash, job.header.height, &miner_pubkey);
-    let descriptor = hyphen_neural::WorkDescriptor {
+    let gpu_failure = |error: String| {
+        state.accelerator_failed.store(true, Ordering::Release);
+        format!("GPU mining failed: {error}")
+    };
+    let mut descriptor = hyphen_neural::WorkDescriptor {
         epoch: job.header.height,
         spec,
         threshold: job.header.difficulty,
-        chain_seed: *seed.as_bytes(),
+        chain_seed: [0; 32],
     };
     descriptor
         .validate()
         .map_err(|error| format!("pool sent an unusable work descriptor: {error}"))?;
 
-    let mut weights = vec![0_i64; spec.weight_count()];
-    descriptor
-        .derive_weights(&mut weights)
-        .map_err(|error| format!("cannot derive work weights: {error}"))?;
+    let weights = if let Some(device) = &state.accelerator {
+        let (seed, weights) = device
+            .prepare_job(&parent_hash, descriptor.epoch, &miner_pubkey)
+            .map_err(gpu_failure)?;
+        descriptor.chain_seed = seed;
+        weights
+    } else {
+        descriptor.chain_seed =
+            *hyphen_core::neural_work_seed(&parent_hash, descriptor.epoch, &miner_pubkey)
+                .as_bytes();
+        let mut weights = vec![0; spec.weight_count()];
+        descriptor
+            .derive_weights(&mut weights)
+            .map_err(|error| format!("cannot derive work weights: {error}"))?;
+        weights
+    };
     let stride = thread_count.max(1) as u64;
     let mut counter = thread_id as u64;
     let mut attempts: u64 = 0;
@@ -1451,54 +1465,28 @@ fn mine_neural_block(
         {
             return Ok(());
         }
-        if !state.accelerator_failed.load(Ordering::Acquire)
-            && let Some(device) = &state.accelerator
-        {
+        if let Some(device) = &state.accelerator {
             let remaining = (u64::MAX - counter) / stride;
-            let window = remaining.saturating_add(1).min(256) as u32;
-            let checked = device
-                .neural_scores(&descriptor, &weights, counter, stride, window)
-                .and_then(|scores| {
-                    for (index, &score) in scores.iter().enumerate() {
-                        let nonce = counter + index as u64 * stride;
-                        if hyphen_neural::block_work::qualifies(&descriptor, nonce, score)
-                            .map_err(|e| e.to_string())?
-                        {
-                            let checked = hyphen_neural::block_work::nonce_score(
-                                &descriptor,
-                                &weights,
-                                nonce,
-                            )
-                            .map_err(|e| e.to_string())?;
-                            if checked != score {
-                                return Err("winning score differs from Rust".into());
-                            }
-                            return Ok(Some(nonce));
-                        }
-                    }
-                    Ok(None)
-                });
-            match checked {
-                Ok(winner) => {
-                    attempts = attempts.saturating_add(u64::from(window));
-                    state
-                        .total_operations
-                        .fetch_add(u64::from(window), Ordering::Relaxed);
-                    if let Some(nonce) = winner {
-                        backend = device.backend();
-                        break nonce;
-                    }
-                    if remaining < u64::from(window) {
-                        return Ok(());
-                    }
-                    counter += stride * u64::from(window);
-                    continue;
-                }
-                Err(error) => {
-                    state.accelerator_failed.store(true, Ordering::Release);
-                    warn!("Neural accelerator disabled, retrying window on CPU: {error}");
-                }
+            // Smaller windows avoid unnecessary work at easier thresholds.
+            let expected = descriptor.expected_attempts().saturating_mul(16);
+            let limit = expected.clamp(1024, u64::from(accelerator::NEURAL_WINDOW));
+            let window = remaining.saturating_add(1).min(limit).min(batch_size) as u32;
+            let winners = device
+                .neural_winners(&descriptor, &weights, counter, stride, window)
+                .map_err(gpu_failure)?;
+            attempts = attempts.saturating_add(u64::from(window));
+            state
+                .total_operations
+                .fetch_add(u64::from(window), Ordering::Relaxed);
+            if let Some(&index) = winners.first() {
+                backend = device.backend();
+                break counter + u64::from(index) * stride;
             }
+            if remaining < u64::from(window) {
+                return Ok(());
+            }
+            counter += stride * u64::from(window);
+            continue;
         }
         let score = hyphen_neural::block_work::nonce_score(&descriptor, &weights, counter)
             .map_err(|e| e.to_string())?;
@@ -1516,13 +1504,25 @@ fn mine_neural_block(
     };
 
     let witnesses = vec![nonce];
-    let commitment = hyphen_core::neural_work_commitment(
-        &parent_hash,
-        job.header.height,
-        job.header.difficulty,
-        &miner_pubkey,
-        &witnesses,
-    );
+    let commitment = if let Some(device) = &state.accelerator {
+        device
+            .work_commitment(
+                &parent_hash,
+                descriptor.epoch,
+                descriptor.threshold,
+                &miner_pubkey,
+                nonce,
+            )
+            .map_err(gpu_failure)?
+    } else {
+        hyphen_core::neural_work_commitment(
+            &parent_hash,
+            job.header.height,
+            job.header.difficulty,
+            &miner_pubkey,
+            &witnesses,
+        )
+    };
 
     let mut header = job.header.clone();
     header.pow_commitment = commitment;
@@ -1570,7 +1570,7 @@ fn run_accelerator_check(
     offset: u64,
     stride: u64,
     timings: bool,
-    accelerator_dir: Option<&std::path::Path>,
+    accelerator_dir: &std::path::Path,
 ) -> Result<(), String> {
     if !(1..=accelerator::NEURAL_WINDOW).contains(&batch) {
         return Err(format!(
@@ -1597,21 +1597,16 @@ fn run_accelerator_check(
     work.derive_weights(&mut weights)
         .map_err(|e| e.to_string())?;
     let device = Accelerator::load(accelerator_dir, true)?;
+    let (gpu_seed, gpu_weights) = device.prepare_job(&genesis, 1, &[19; 32])?;
+    if gpu_seed != work.chain_seed || gpu_weights != weights {
+        return Err("GPU and Rust job descriptors differ".into());
+    }
     let device_start = std::time::Instant::now();
     let scores = device.neural_scores(&work, &weights, offset, stride, batch)?;
     let device_scoring = device_start.elapsed();
-    let mut device_winners = Vec::new();
-    if timings {
-        for (i, &score) in scores.iter().enumerate() {
-            let nonce = offset + i as u64 * stride;
-            if hyphen_neural::block_work::qualifies(&work, nonce, score)
-                .map_err(|e| e.to_string())?
-            {
-                device_winners.push(nonce);
-            }
-        }
-    }
-    let device_total = device_start.elapsed();
+    let search_start = std::time::Instant::now();
+    let device_winners = device.neural_winners(&work, &gpu_weights, offset, stride, batch)?;
+    let device_total = search_start.elapsed();
     let mut winners = 0;
     let cpu_start = std::time::Instant::now();
     for (i, device_score) in scores.into_iter().enumerate() {
@@ -1624,19 +1619,28 @@ fn run_accelerator_check(
             ));
         }
         if hyphen_neural::block_work::qualifies(&work, nonce, score).map_err(|e| e.to_string())? {
-            if timings && device_winners.get(winners) != Some(&nonce) {
-                return Err("accelerator and CPU winner lists differ".into());
+            if device_winners.get(winners) != Some(&(i as u32)) {
+                return Err(format!("GPU and Rust winner lists differ at nonce {nonce}"));
             }
             winners += 1;
         }
     }
     let cpu_total = cpu_start.elapsed();
-    if timings {
-        if winners != device_winners.len() {
-            return Err("accelerator and CPU winner counts differ".into());
+    if winners != device_winners.len() {
+        return Err("accelerator and CPU winner counts differ".into());
+    }
+    if let Some(&index) = device_winners.first() {
+        let nonce = offset + u64::from(index) * stride;
+        let gpu = device.work_commitment(&genesis, 1, work.threshold, &[19; 32], nonce)?;
+        if gpu
+            != hyphen_core::neural_work_commitment(&genesis, 1, work.threshold, &[19; 32], &[nonce])
+        {
+            return Err("GPU and Rust work commitments differ".into());
         }
+    }
+    if timings {
         println!(
-            "device_score_ns={} device_host_search_ns={} cpu_search_ns={}",
+            "device_score_ns={} gpu_search_ns={} cpu_search_ns={}",
             device_scoring.as_nanos(),
             device_total.as_nanos(),
             cpu_total.as_nanos()
@@ -1673,59 +1677,6 @@ fn search_witnesses(
         if available == 0 {
             break;
         }
-        let accelerator_ready = cursor.next >= hyphen_pow::SMALL_PRIME_SIEVE_LIMIT as u64;
-        if accelerator_ready
-            && !state.accelerator_failed.load(Ordering::Acquire)
-            && let Some(accelerator) = state.accelerator.as_ref()
-        {
-            let scanned = available.min(accelerator.max_candidates() as u64) as u32;
-            let missing = count - witnesses.len() as u64;
-            let max_survivors = missing
-                .saturating_mul(8)
-                .saturating_add(1_024)
-                .clamp(1, scanned as u64) as u32;
-            match accelerator.scan(
-                cursor.next,
-                cursor.stride,
-                scanned,
-                chain_length,
-                max_survivors,
-            ) {
-                Ok(outcome) if !outcome.truncated => {
-                    state
-                        .total_operations
-                        .fetch_add(scanned as u64, Ordering::Relaxed);
-                    let mut consumed = u64::from(scanned);
-                    for candidate in outcome.survivors {
-                        if witnesses.contains(&candidate)
-                            || !hyphen_pow::vms::chain_is_valid_after_sieve(candidate, chain_length)
-                            || state.is_locally_claimed(candidate)?
-                        {
-                            continue;
-                        }
-                        witnesses.push(candidate);
-                        if witnesses.len() as u64 == count {
-                            consumed = (candidate - cursor.next) / cursor.stride + 1;
-                            break;
-                        }
-                    }
-                    cursor.advance(consumed);
-                    continue;
-                }
-                // A truncated device result can omit any survivor. Let the CPU
-                // consume this window from the same starting point.
-                Ok(_) => {
-                    state
-                        .total_operations
-                        .fetch_add(u64::from(scanned), Ordering::Relaxed);
-                }
-                Err(error) => {
-                    warn!("Native accelerator disabled after device error: {error}");
-                    state.accelerator_failed.store(true, Ordering::Release);
-                }
-            }
-        }
-
         let read_error = std::cell::Cell::new(None);
         let is_claimed = |candidate: u64| {
             state.is_locally_claimed(candidate).unwrap_or_else(|error| {

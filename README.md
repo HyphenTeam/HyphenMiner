@@ -2,7 +2,7 @@
 
 [简体中文](README_CN.md) · [Miner documentation](https://github.com/HyphenTeam/HyphenMiner/wiki)
 
-Hyphen Miner searches a nonce on the neural development network. CPUs and the CUDA plugin compute the same fixed-point neural score. The host applies BLAKE3 scratchpad and signs a successful block for the SOLO pool.
+Hyphen Miner searches HYN3 nonces on the CPU by default. Add `--accelerator-dir DIRECTORY` to derive the job seed and weights, score candidates, evaluate the BLAKE3 gate and scratchpad, and compute the winning work commitment on CUDA. The host signs winning blocks and submits them to the SOLO pool.
 
 ## Mine on devnet
 

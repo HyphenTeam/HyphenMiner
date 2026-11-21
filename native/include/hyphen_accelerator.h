@@ -18,6 +18,10 @@ extern "C" {
 #define HYPHEN_KERNEL_DIFFUSION_2D_Q12_V1 2u
 #define HYPHEN_KERNEL_CUNNINGHAM_SIEVE_V1 3u
 #define HYPHEN_KERNEL_NEURAL_WORK_V1 4u
+#define HYPHEN_KERNEL_NEURAL_SEARCH_V1 5u
+#define HYPHEN_KERNEL_NEURAL_PREPARE_V1 6u
+#define HYPHEN_KERNEL_NEURAL_COMMIT_V1 7u
+#define HYPHEN_CAP_NEURAL_SEARCH_V1 (UINT64_C(1) << 4)
 #define HYPHEN_CAP_NEURAL_WORK_V1 (UINT64_C(1) << 3)
 #define HYPHEN_CAP_DIFFUSION_2D_Q12_V1 (UINT64_C(1) << 1)
 #define HYPHEN_CAP_CUNNINGHAM_SIEVE_V1 (UINT64_C(1) << 2)
@@ -99,6 +103,22 @@ typedef struct HyphenNeuralWorkRequestV1 {
   uint32_t seed_words[8]; // little-endian words of the public work seed
   int64_t weights[2128]; // W1, b1, W2, b2 in the consensus Q32.32 layout
 } HyphenNeuralWorkRequestV1;
+
+// Kernel 5 runs the complete HYN3 search. Returns a native u32 count followed
+// by that many distinct u32 window indices. The final threshold is exclusive.
+typedef struct HyphenNeuralSearchRequestV1 {
+  HyphenNeuralWorkRequestV1 work;
+  uint64_t threshold;
+} HyphenNeuralSearchRequestV1;
+
+// Kernels 6/7 hash a zero-padded canonical work transcript, 65..128 bytes.
+// Kernel 6 returns the seed plus 2128 native i64 weights. Kernel 7 returns a digest.
+typedef struct HyphenNeuralTranscriptV1 {
+  uint64_t height;
+  uint32_t length;
+  uint32_t reserved;
+  uint32_t words[32];
+} HyphenNeuralTranscriptV1;
 
 typedef int32_t (*HyphenEnumerateDevicesV1)(HyphenDeviceInfoV1 *devices,
                                             uint32_t capacity,

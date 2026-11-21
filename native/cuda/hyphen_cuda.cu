@@ -172,7 +172,8 @@ int32_t enumerate_devices(HyphenDeviceInfoV1 *devices, uint32_t capacity,
     info.device_ordinal = static_cast<uint32_t>(ordinal);
     info.device_kind = HYPHEN_DEVICE_KIND_GPU;
     info.hardware_accelerated = 1;
-    info.capability_mask = HYPHEN_CAP_CUNNINGHAM_SIEVE_V1 | HYPHEN_CAP_NEURAL_WORK_V1;
+    info.capability_mask = HYPHEN_CAP_CUNNINGHAM_SIEVE_V1 | HYPHEN_CAP_NEURAL_WORK_V1 |
+                           HYPHEN_CAP_NEURAL_SEARCH_V1;
     copy_text(info.backend, "cuda");
     copy_text(info.vendor, "NVIDIA");
     copy_text(info.name, properties.name);
@@ -403,6 +404,8 @@ int32_t execute_cunningham_sieve(const HyphenExecuteRequestV1 *request,
 }
 
 #include "neural_work.cuh"
+#include "neural_search.cuh"
+#include "neural_job.cuh"
 
 int32_t execute_request(const HyphenExecuteRequestV1 *request,
                         HyphenExecuteResultV1 *result) {
@@ -412,6 +415,13 @@ int32_t execute_request(const HyphenExecuteRequestV1 *request,
   }
   if (request->kernel_id == HYPHEN_KERNEL_NEURAL_WORK_V1) {
     return execute_neural_work(request, result);
+  }
+  if (request->kernel_id == HYPHEN_KERNEL_NEURAL_SEARCH_V1) {
+    return execute_neural_search(request, result);
+  }
+  if (request->kernel_id == HYPHEN_KERNEL_NEURAL_PREPARE_V1 ||
+      request->kernel_id == HYPHEN_KERNEL_NEURAL_COMMIT_V1) {
+    return execute_neural_transcript(request, result);
   }
   if (request->kernel_id != HYPHEN_KERNEL_CUNNINGHAM_SIEVE_V1) {
     set_error("unsupported accelerator kernel");
