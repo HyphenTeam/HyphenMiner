@@ -10,6 +10,8 @@ Each accepted SOLO nonce must satisfy both the fixed neural gate and the blockâ€
 
 Use `--threads N --no-accelerator` to select CPU workers. To build the CUDA backend, run `cmake -S native -B native/build -DHYPHEN_ENABLE_CUDA=ON` followed by `cmake --build native/build --config Release`. Point `--accelerator-dir` at the directory containing the plugin. It computes batches of neural scores and the host checks qualifying nonces. To verify complete device windows against Rust, set `HYPHEN_ACCELERATOR_DIR` and run `cargo test --release --locked native_neural_windows_match_rust -- --ignored`.
 
+For GeForce GTX 1060 (Pascal, compute capability 6.1), configure a fresh build with CUDA 12.x. The default targets include native `sm_61`, `sm_75`, `sm_86` code and `compute_61` PTX. With Ninja, pass `-DCMAKE_BUILD_TYPE=Release` at configure time. CUDA 13 dropped offline compilation for Pascal. On the target machine, run `hyphen-miner --accelerator-dir DIRECTORY accelerator-check --batch 32768 --timings` to compare every score and winning nonce with Rust. Use `device_host_search_ns` for the complete mining search, including the host memory phase.
+
 Run `hyphen-miner --accelerator-dir DIRECTORY accelerator-check --offset 125 --batch 1` to reproduce the first-height HYN3 vector. The check compares every returned device score with Rust, applies the memory gate and prints `scores=1 accepted=1` for this nonce. [Reference vector](https://github.com/HyphenTeam/Hyphen/blob/main/test-vectors/neural-block-work-v3.json)
 
 For an operator-provided SOCKS5 or HTTP CONNECT proxy use `--via-proxy socks5://HOST:PORT` or `--via-proxy http://HOST:PORT`. Set `--pool` to the destination pool address. Job changes invalidate outstanding work for that parent.

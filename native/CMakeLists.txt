@@ -35,9 +35,16 @@ if(HYPHEN_ENABLE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   add_library(hyphen_cuda SHARED cuda/hyphen_cuda.cu)
   target_compile_features(hyphen_cuda PRIVATE cxx_std_17 cuda_std_17)
-  target_link_libraries(hyphen_cuda PRIVATE CUDA::cudart)
-  set(HYPHEN_CUDA_ARCHITECTURES "native" CACHE STRING
-      "CUDA architectures for the miner plugin (for example 75;86;89)")
+  set_target_properties(hyphen_cuda PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  # CUDA 12 can ship Pascal SASS and forward-compatible PTX in the same
+  # plugin. CUDA 13 dropped offline compilation for compute capability 6.1.
+  set(default_cuda_architectures native)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12 AND
+     CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13)
+    set(default_cuda_architectures "61;75-real;86-real")
+  endif()
+  set(HYPHEN_CUDA_ARCHITECTURES "${default_cuda_architectures}" CACHE STRING
+      "CUDA architectures for the miner plugin (native for a local build)")
   set_target_properties(hyphen_cuda PROPERTIES
     CUDA_ARCHITECTURES "${HYPHEN_CUDA_ARCHITECTURES}")
   hyphen_configure_plugin(hyphen_cuda hyphen_backend_cuda)
